@@ -1,0 +1,38 @@
+# Secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+**/.venv/
+
+# Outputs, cache, model artifacts
+outputs/
+**/outputs/
+**/text_cache/
+**/vision_cache/
+**/whisper_cache/
+*.pt
+
+# Local challenge data
+data/sample_data_lake/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

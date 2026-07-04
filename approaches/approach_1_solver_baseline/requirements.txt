@@ -1,0 +1,21 @@
+pandas
+numpy
+openpyxl
+scikit-learn
+beautifulsoup4
+lxml
+pymupdf
+pdfplumber
+python-docx
+python-pptx
+pillow
+pytesseract
+openai
+requests
+tqdm
+python-dotenv
+pytest
+
+# Optional:
+# openai-whisper
+# rank-bm25
