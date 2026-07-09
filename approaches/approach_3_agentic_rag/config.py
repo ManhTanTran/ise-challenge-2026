@@ -13,7 +13,8 @@ load_dotenv()
 APPROACH_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = APPROACH_ROOT / "outputs"
 
-# Embedding runs LOCALLY via sentence-transformers (no OpenRouter cost).
+# Embedding defaults to local sentence-transformers/fastembed/TF-IDF. Set
+# ISE_EMBEDDING_PROVIDER=openrouter to use OpenRouter's embeddings endpoint.
 DEFAULT_EMBEDDING_MODEL = os.getenv(
     "ISE_EMBEDDING_MODEL",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",

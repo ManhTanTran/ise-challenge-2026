@@ -174,3 +174,26 @@ def answer_image_from_file(question: str, image_path: str | Path, context: str =
         temperature=0,
     )
     return normalize_spaces(response.choices[0].message.content or "")
+
+
+def transcribe_audio_file(audio_path: str | Path, model: str | None = None) -> str:
+    """Transcribe audio through OpenRouter's audio transcription endpoint."""
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set.")
+    selected_model = model or os.getenv("ISE_TRANSCRIPTION_MODEL", "openai/whisper-1")
+
+    from openai import OpenAI
+
+    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
+    path = Path(audio_path)
+    with path.open("rb") as handle:
+        response = client.audio.transcriptions.create(
+            model=selected_model,
+            file=handle,
+        )
+    text = getattr(response, "text", "")
+    if not text and isinstance(response, dict):
+        text = str(response.get("text", ""))
+    return normalize_spaces(text)

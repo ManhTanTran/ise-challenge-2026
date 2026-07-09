@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from ..shared_src.utils import dump_json, ensure_dir, load_json, stable_hash
-from .embedder import TfidfBackend, create_backend
+from .embedder import OpenRouterEmbeddingBackend, TfidfBackend, create_backend
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +104,10 @@ class VectorIndex:
                 backend = TfidfBackend()
                 backend.load(index_dir)
                 embeddings = sparse.load_npz(index_dir / "embeddings.npz")
+                return cls(backend, embeddings, meta)
+            if meta.get("kind") == "openrouter":
+                backend = OpenRouterEmbeddingBackend(str(meta.get("model_name", "")))
+                embeddings = np.load(index_dir / "embeddings.npy")
                 return cls(backend, embeddings, meta)
 
             backend = create_backend(str(meta.get("model_name", "")))

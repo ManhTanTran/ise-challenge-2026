@@ -78,7 +78,11 @@ Cần `OPENROUTER_API_KEY` trong `.env` (xem `.env.example` ở root). Model qua
 OPENROUTER_MODEL=openai/gpt-4.1-mini     # reasoning + table codegen
 ISE_ANALYSIS_MODEL=...                   # optional: model rẻ hơn cho Buoc 1
 ISE_VISION_MODEL=...                     # optional: model vision riêng
-ISE_EMBEDDING_MODEL=...                  # optional: sentence-transformers model
+ISE_EMBEDDING_PROVIDER=auto              # auto/local by default; set openrouter for API embeddings
+ISE_EMBEDDING_MODEL=...                  # local sentence-transformers or OpenRouter embedding model
+ISE_TRANSCRIPTION_PROVIDER=local         # set openrouter to use OpenRouter audio transcription
+ISE_TRANSCRIPTION_MODEL=openai/whisper-1 # OpenRouter STT model when provider=openrouter
+ISE_LOCAL_WHISPER_MODEL=base             # local openai-whisper model; use large-v3/turbo on Colab GPU
 ```
 
 Không có key: pipeline vẫn chạy (retrieval + extractive fallback), chất lượng thấp hơn.

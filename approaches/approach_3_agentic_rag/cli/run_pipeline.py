@@ -168,7 +168,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--embedding-model",
         default=None,
-        help="sentence-transformers model name for the vector index.",
+        help="Embedding model for the vector index; with ISE_EMBEDDING_PROVIDER=openrouter, use an OpenRouter embedding model.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Debug: solve only the first N questions.")
     parser.add_argument("--no-llm", action="store_true", help="Disable every LLM call (offline mode).")

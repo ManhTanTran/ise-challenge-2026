@@ -832,7 +832,50 @@ def _safe_int(value: Any) -> int:
 
 
 def read_audio(path: Path) -> ReadResult:
-    """Transcribe audio with Whisper if installed."""
+    """Transcribe audio with OpenRouter or local Whisper, then cache the text."""
+
+    transcript_cache = _audio_transcript_cache_path(path)
+    if transcript_cache.exists():
+        cached = load_json(transcript_cache, default={})
+        if isinstance(cached, dict) and cached.get("text"):
+            return ReadResult(
+                str(path),
+                "audio",
+                content=str(cached.get("text", "")).strip(),
+                metadata={
+                    "transcription_engine": cached.get("engine", "cached"),
+                    "transcript_cache_path": str(transcript_cache),
+                },
+            )
+
+    provider = os.getenv("ISE_TRANSCRIPTION_PROVIDER", "local").strip().lower()
+    if provider == "openrouter":
+        try:
+            from .llm_client import transcribe_audio_file
+
+            text = transcribe_audio_file(path)
+            result = {
+                "text": text.strip(),
+                "engine": os.getenv("ISE_TRANSCRIPTION_MODEL", "openai/whisper-1"),
+            }
+            dump_json(result, transcript_cache)
+            return ReadResult(
+                str(path),
+                "audio",
+                content=result["text"],
+                metadata={
+                    "transcription_engine": result["engine"],
+                    "transcript_cache_path": str(transcript_cache),
+                },
+            )
+        except Exception as exc:
+            return ReadResult(
+                str(path),
+                "audio",
+                content="",
+                metadata={"needs_audio_transcription": True},
+                error=f"OpenRouter audio transcription failed: {exc}",
+            )
 
     try:
         _ensure_tool_on_path("ffmpeg")
@@ -842,13 +885,20 @@ def read_audio(path: Path) -> ReadResult:
             os.getenv("WHISPER_CACHE_DIR", str(Path.cwd() / "outputs" / "whisper_cache"))
         )
         ensure_dir(whisper_cache)
-        model = whisper.load_model("base", download_root=str(whisper_cache))
+        whisper_model = os.getenv("ISE_LOCAL_WHISPER_MODEL", "base")
+        model = whisper.load_model(whisper_model, download_root=str(whisper_cache))
         transcription = model.transcribe(str(path))
+        text = str(transcription.get("text", "")).strip()
+        engine = f"whisper-{whisper_model}"
+        dump_json({"text": text, "engine": engine}, transcript_cache)
         return ReadResult(
             str(path),
             "audio",
-            content=str(transcription.get("text", "")).strip(),
-            metadata={"transcription_engine": "whisper-base"},
+            content=text,
+            metadata={
+                "transcription_engine": engine,
+                "transcript_cache_path": str(transcript_cache),
+            },
         )
     except Exception as exc:
         return ReadResult(
@@ -858,6 +908,16 @@ def read_audio(path: Path) -> ReadResult:
             metadata={"needs_audio_transcription": True},
             error=f"Audio transcription unavailable or failed: {exc}",
         )
+
+
+def _audio_transcript_cache_path(path: Path) -> Path:
+    cache_dir = ensure_dir(os.getenv("ISE_TRANSCRIPT_CACHE_DIR", str(Path.cwd() / "outputs" / "transcript_cache")))
+    stat_key = ""
+    if path.exists():
+        stat = path.stat()
+        stat_key = f":{stat.st_size}:{int(stat.st_mtime)}"
+    key = stable_hash(f"audio_transcript:{path.as_posix()}:{stat_key}")
+    return cache_dir / f"{key}_transcript.json"
 
 
 _HEADER_LABEL_WORDS = {

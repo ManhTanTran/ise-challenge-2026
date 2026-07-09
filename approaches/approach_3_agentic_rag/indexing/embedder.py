@@ -8,6 +8,7 @@ the whole system still runs offline with the base requirements.
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,43 @@ class FastEmbedBackend:
         return None
 
 
+class OpenRouterEmbeddingBackend:
+    """Dense embeddings through OpenRouter's embeddings endpoint."""
+
+    kind = "openrouter"
+
+    def __init__(self, model_name: str) -> None:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is required for OpenRouter embeddings.")
+        self.model_name = model_name.replace("openrouter/", "", 1)
+        self._api_key = api_key
+
+    def fit(self, corpus: list[str]) -> None:
+        return None
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, 1), dtype=np.float32)
+
+        from openai import OpenAI
+
+        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=self._api_key)
+        response = client.embeddings.create(model=self.model_name, input=texts)
+        vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
+        if vectors.ndim == 1:
+            vectors = vectors.reshape(1, -1)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vectors / norms
+
+    def save(self, directory: Path) -> None:
+        return None
+
+    def load(self, directory: Path) -> None:
+        return None
+
+
 class TfidfBackend:
     """Sparse char n-gram TF-IDF fallback (language agnostic, no downloads)."""
 
@@ -122,12 +160,20 @@ class TfidfBackend:
         self._fitted = True
 
 
-def create_backend(model_name: str) -> SentenceTransformerBackend | FastEmbedBackend | TfidfBackend:
+def create_backend(
+    model_name: str,
+) -> SentenceTransformerBackend | FastEmbedBackend | OpenRouterEmbeddingBackend | TfidfBackend:
     """Return the best available embedding backend.
 
     Preference order: sentence-transformers (best quality) -> fastembed (dense
     multilingual, no torch) -> char TF-IDF (always works, no downloads).
     """
+
+    provider = os.getenv("ISE_EMBEDDING_PROVIDER", "auto").strip().lower()
+    if provider == "openrouter" or model_name.startswith("openrouter/"):
+        backend = OpenRouterEmbeddingBackend(model_name)
+        LOGGER.info("Embedding backend: OpenRouter (%s)", backend.model_name)
+        return backend
 
     try:
         backend = SentenceTransformerBackend(model_name)
