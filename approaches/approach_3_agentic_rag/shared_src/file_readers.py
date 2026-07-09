@@ -853,6 +853,39 @@ def _merge_image_parses(local_parse: dict[str, Any], vlm_parse: dict[str, Any]) 
     return merged
 
 
+def enrich_image_parse_with_vlm(
+    path: str | Path,
+    *,
+    parse_cache_path: str | Path,
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    """Add VLM captions/text to an already OCR-parsed image and persist it.
+
+    This is the selective second pass used after indexing: if OCR is weak, we
+    keep the OCR output, call the VLM only for that image, then merge the two
+    parses back into the structured image cache.
+    """
+
+    image_path = Path(path)
+    cache_path = Path(parse_cache_path)
+    if use_cache and cache_path.exists():
+        parsed = load_json(cache_path, default={})
+        if isinstance(parsed, dict):
+            local_parse = parsed
+        else:
+            local_parse = {}
+    else:
+        local_parse = {}
+
+    vlm_parse = _vlm_image_parse(image_path)
+    if not vlm_parse:
+        return local_parse
+
+    merged = _merge_image_parses(local_parse, vlm_parse) if local_parse else vlm_parse
+    dump_json(merged, cache_path)
+    return merged
+
+
 def _image_index_content(parsed: dict[str, Any]) -> str:
     pieces = []
     plain_text = normalize_spaces(parsed.get("plain_text", ""))
