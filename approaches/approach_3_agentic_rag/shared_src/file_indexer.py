@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from .config import get_config
 from .file_readers import file_metadata, read_file
-from .utils import dump_json, ensure_dir, stable_file_id, truncate_text
+from .utils import dump_json, ensure_dir, load_json, stable_file_id, truncate_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +64,60 @@ def build_file_index(
     output.parent.mkdir(parents=True, exist_ok=True)
     dump_json(items, output)
     LOGGER.info("Indexed %d files to %s", len(items), output)
+    return items
+
+
+def reindex_failed_files(
+    manifest_path: str | Path,
+    data_lake_dir: str | Path,
+    *,
+    cache_dir: str | Path | None = None,
+    statuses: tuple[str, ...] = ("error",),
+) -> list[dict[str, Any]]:
+    """Re-run indexing only for files marked with a failing status.
+
+    Lets a full indexing pass finish once (accepting some per-file failures -
+    e.g. a parser bug that's since been fixed), then retries just those files
+    afterward instead of re-scanning and re-extracting every already-good
+    file (OCR/Whisper are the expensive steps `read_file`'s own per-file
+    cache already skips on a hit; only files that failed never wrote that
+    cache, so only they redo real work here). Writes the merged manifest
+    back to `manifest_path`.
+
+    IMPORTANT: after calling this, delete the work dir's `chunks.json` (and
+    the vector_index it feeds) before the next `build_indexes(...)` call -
+    chunks.json is itself only rebuilt when it's missing/stale, so a fixed
+    manifest alone won't reach retrieval until `chunks.json` is regenerated
+    from it.
+    """
+
+    manifest_file = Path(manifest_path)
+    items = load_json(manifest_file, default=[])
+    if not isinstance(items, list):
+        raise ValueError(f"{manifest_file} does not contain a manifest list.")
+
+    data_root = Path(data_lake_dir).expanduser().resolve()
+    cache = Path(cache_dir) if cache_dir else manifest_file.parent / "text_cache"
+    ensure_dir(cache)
+
+    to_retry = [(index, item) for index, item in enumerate(items) if item.get("status") in statuses]
+    if not to_retry:
+        LOGGER.info("No files with status in %s - nothing to retry.", statuses)
+        return items
+
+    for index, item in tqdm(to_retry, desc="Retrying failed files"):
+        relative = str(item.get("relative_path", ""))
+        absolute = data_root / relative
+        if not absolute.exists():
+            LOGGER.warning("Skipping missing file: %s", absolute)
+            continue
+        items[index] = index_file(absolute, data_root, cache_dir=cache, force=True)
+
+    dump_json(items, manifest_file)
+    still_failing = [item for item in items if item.get("status") == "error"]
+    LOGGER.info(
+        "Retried %d file(s); %d still failing.", len(to_retry), len(still_failing)
+    )
     return items
 
 

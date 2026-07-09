@@ -149,6 +149,35 @@ def read_file(
     return result
 
 
+def _detect_csv_skiprows(path: Path, encoding: str, *, max_scan_lines: int = 30) -> int:
+    """Find how many leading lines to skip before a CSV's real header row.
+
+    Some CSV exports prepend a title/notes line (often a single bare column)
+    before the real, wider header - pandas' C parser locks its expected
+    column count onto line 0, then raises "Expected N fields, saw M" once it
+    reaches the real data (observed: "Expected 1 fields in line 4, saw 4").
+    Scan the first few lines' field counts and skip to the first line whose
+    count matches the majority of the lines scanned - the real table width.
+    """
+
+    import csv as csv_module
+    from collections import Counter
+
+    try:
+        with open(path, encoding=encoding, newline="") as handle:
+            reader = csv_module.reader(handle)
+            rows = [row for _, row in zip(range(max_scan_lines), reader)]
+    except Exception:
+        return 0
+    if len(rows) < 2:
+        return 0
+    counts = [len(row) for row in rows]
+    majority_count, majority_hits = Counter(counts).most_common(1)[0]
+    if majority_hits < 2:
+        return 0
+    return next((index for index, count in enumerate(counts) if count == majority_count), 0)
+
+
 def read_csv(path: Path) -> ReadResult:
     """Read CSV with encoding fallback."""
 
@@ -162,10 +191,26 @@ def read_csv(path: Path) -> ReadResult:
             break
         except UnicodeDecodeError as exc:
             last_error = exc
-        except pd.errors.ParserError:
-            dataframe = pd.read_csv(path, encoding=encoding, sep=None, engine="python")
-            used_encoding = encoding
-            break
+        except pd.errors.ParserError as exc:
+            last_error = exc
+            skiprows = _detect_csv_skiprows(path, encoding)
+            try:
+                if skiprows > 0:
+                    dataframe = pd.read_csv(path, encoding=encoding, skiprows=skiprows)
+                else:
+                    dataframe = pd.read_csv(path, encoding=encoding, sep=None, engine="python")
+                used_encoding = encoding
+                break
+            except Exception as exc2:
+                last_error = exc2
+                # Genuinely ragged rows even after header-skip - skip the
+                # unparseable lines rather than losing the whole file.
+                try:
+                    dataframe = pd.read_csv(path, encoding=encoding, on_bad_lines="skip")
+                    used_encoding = encoding
+                    break
+                except Exception as exc3:
+                    last_error = exc3
     if dataframe is None:
         raise RuntimeError(f"Could not read CSV: {last_error}")
     content = dataframe.head(50).to_csv(index=False)
@@ -242,11 +287,14 @@ def read_excel(path: Path) -> ReadResult:
 
 
 def _excel_preview_rows(rows: list[list[Any]], max_column: int) -> tuple[list[str], list[list[Any]]]:
-    """Return rectangular Excel preview rows even when the first row is short.
+    """Return rectangular Excel preview rows, skipping any leading title/notes rows.
 
     Some real workbooks have a title/metadata row with only a few cells, then a
     much wider body. Pandas requires len(columns) == row width, so build a
     stable rectangular preview based on the widest observed row/max_column.
+    The header itself isn't always row 0 either (scientific data supplements
+    routinely prepend a title/notes block before the real header) - reuse the
+    same scoring heuristic as `_detect_header_row` to find it.
     """
 
     if not rows:
@@ -255,13 +303,14 @@ def _excel_preview_rows(rows: list[list[Any]], max_column: int) -> tuple[list[st
     if width <= 0:
         return [], []
 
-    raw_header = _pad_excel_row(rows[0], width)
+    header_index = _best_header_row_index(rows)
+    raw_header = _pad_excel_row(rows[header_index], width)
     header = []
     for index, value in enumerate(raw_header, start=1):
         text = str(value).strip()
         header.append(text if text else f"Unnamed: {index}")
 
-    return header, [_pad_excel_row(row, width) for row in rows[1:]]
+    return header, [_pad_excel_row(row, width) for row in rows[header_index + 1 :]]
 
 
 def _pad_excel_row(row: list[Any], width: int) -> list[Any]:
@@ -988,40 +1037,56 @@ def _restore_headerless_list_row(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"value": [header, *values.tolist()]})
 
 
+def _best_header_row_index(rows: list[list[Any]]) -> int:
+    """Pick the first row that looks like a real header out of a list of raw rows.
+
+    Shared scoring heuristic behind both `_detect_header_row` (re-reads an
+    xlsx sheet via pandas for `load_table_file`) and `_excel_preview_rows`
+    (works on rows already loaded via openpyxl for the fast indexing-time
+    preview) - some Excel exports (e.g. scientific data supplements) prepend
+    a few metadata/notes rows before the actual column header, so row 0 isn't
+    always it. A qualifying header row: mostly non-null, mostly short
+    strings (not long prose or numbers), and mostly DISTINCT - a
+    units/annotation row like "(ppm)" repeated across every column is
+    short-string-shaped too but not distinct, so it's skipped in favor of the
+    real header sitting just below it.
+
+    Deliberately returns the FIRST qualifying row, not the "best" one by some
+    score: a real header row is itself followed by data rows that can easily
+    look header-shaped too (e.g. a column of short, all-distinct string
+    values) - preferring "more filled cells" among all qualifying rows would
+    then skip past a perfectly good header into the data beneath it.
+    """
+
+    for row_index, row in enumerate(rows):
+        non_null = [v for v in row if v is not None and v != "" and not (isinstance(v, float) and pd.isna(v))]
+        if len(non_null) < 2:
+            continue
+        header_like = sum(1 for v in non_null if isinstance(v, str) and 0 < len(v.strip()) <= 40)
+        if header_like < max(2, int(0.7 * len(non_null))):
+            continue
+        distinct_ratio = len({str(v) for v in non_null}) / len(non_null)
+        if distinct_ratio < 0.7:
+            continue
+        return row_index
+    return 0
+
+
 def _detect_header_row(path: Path, sheet_name: str, *, max_scan_rows: int = 15) -> int:
     """Find the row that looks like the real header, skipping leading title/notes rows.
 
-    Some Excel exports (e.g. scientific data supplements) prepend a few
-    metadata/notes rows before the actual column header - pandas' default
-    header=0 then reads that leading text as columns, produces "Unnamed: N"
-    placeholders, and the real header becomes ordinary (unreferenceable) data.
-    Scan the first few raw rows for header candidates (most non-null cells are
-    short strings, not long prose or numbers) but also require the values to
-    be mostly DISTINCT - a units/annotation row like "(ppm)" repeated across
-    every column is short-string-shaped too, and would otherwise outrank the
-    real header sitting just below it. Among qualifying rows, prefer the one
-    with the most filled-in cells (the real header rarely has gaps; a units
-    sub-header often only decorates a subset of columns).
+    Some Excel exports prepend a few metadata/notes rows before the actual
+    column header - pandas' default header=0 then reads that leading text as
+    columns, produces "Unnamed: N" placeholders, and the real header becomes
+    ordinary (unreferenceable) data. See `_best_header_row_index` for the
+    scoring heuristic.
     """
 
     try:
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None, nrows=max_scan_rows)
     except Exception:
         return 0
-    best_row, best_count = 0, -1
-    for row_index in range(len(raw)):
-        non_null = raw.iloc[row_index].dropna()
-        if len(non_null) < 2:
-            continue
-        header_like = sum(1 for v in non_null if isinstance(v, str) and 0 < len(v.strip()) <= 40)
-        if header_like < max(2, int(0.7 * len(non_null))):
-            continue
-        distinct_ratio = non_null.astype(str).nunique() / len(non_null)
-        if distinct_ratio < 0.7:
-            continue
-        if len(non_null) > best_count:
-            best_row, best_count = row_index, len(non_null)
-    return best_row
+    return _best_header_row_index(raw.values.tolist())
 
 
 def _fix_misplaced_header(frame: pd.DataFrame, path: Path, sheet_name: str) -> pd.DataFrame:
