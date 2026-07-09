@@ -56,3 +56,11 @@ def test_modality_hint_not_image_for_chinh_substring():
 def test_modality_hint_image_for_real_image_word():
     profile = _profile("How many images contain a blue digit?")
     assert profile.modality_hint == "image"
+
+
+def test_modality_hint_audio_for_mp4_filename():
+    # .mp4 is video-shaped by extension but only its audio track is ever
+    # indexed (Whisper), so a question naming one should route as audio,
+    # same as .mp3/.m4a/.wav.
+    profile = _profile("Based on the video workshop_03.22.mp4, how many attended?")
+    assert profile.modality_hint == "audio"

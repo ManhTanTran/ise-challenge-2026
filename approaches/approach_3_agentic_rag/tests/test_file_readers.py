@@ -2,7 +2,21 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from approaches.approach_3_agentic_rag.shared_src.file_readers import read_csv, read_excel
+from approaches.approach_3_agentic_rag.shared_src.file_readers import (
+    _reader_for_extension,
+    modality_for_path,
+    read_audio,
+    read_csv,
+    read_excel,
+)
+
+
+def test_mp4_is_routed_to_the_audio_reader():
+    # .mp4 has no video reader - only its audio track is ever used (via
+    # Whisper's ffmpeg-backed loader, which demuxes audio out of any
+    # container). It must resolve the same way .mp3/.m4a/.wav do.
+    assert modality_for_path("lecture.mp4") == "audio"
+    assert _reader_for_extension(".mp4") is read_audio
 
 
 def test_read_excel_handles_body_wider_than_first_row(tmp_path: Path):

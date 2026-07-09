@@ -35,7 +35,7 @@ LOGGER = logging.getLogger(__name__)
 TABLE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".sql"}
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".ppt", ".txt", ".md", ".html", ".htm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav"}
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4"}
 IMAGE_PARSE_SUFFIX = ".image_parse.json"
 
 
@@ -1204,6 +1204,9 @@ def _reader_for_extension(extension: str) -> Callable[[Path], ReadResult] | None
         ".m4a": read_audio,
         ".mp3": read_audio,
         ".wav": read_audio,
+        # Whisper's ffmpeg-backed audio loader demuxes the audio track out of
+        # any container, video included - no separate extraction step needed.
+        ".mp4": read_audio,
     }
     return readers.get(extension)
 

@@ -30,7 +30,7 @@ from ..shared_src.utils import (
 LOGGER = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
-AUDIO_EXTENSIONS = (".m4a", ".mp3", ".wav")
+AUDIO_EXTENSIONS = (".m4a", ".mp3", ".wav", ".mp4")
 TABLE_EXTENSIONS = (".csv", ".xlsx", ".xls", ".sql")
 DOCUMENT_EXTENSIONS = (".pdf", ".docx", ".pptx", ".ppt", ".txt", ".md", ".html")
 
