@@ -196,8 +196,12 @@ def read_excel(path: Path) -> ReadResult:
                     ["" if value is None else value for value in row]
                     for row in worksheet.iter_rows(max_row=31, values_only=True)
                 ]
-                header = [str(value) for value in rows[0]] if rows else []
-                preview_frame = pd.DataFrame(rows[1:], columns=header) if header else pd.DataFrame()
+                header, preview_rows = _excel_preview_rows(rows, worksheet.max_column or 0)
+                preview_frame = (
+                    pd.DataFrame(preview_rows, columns=header)
+                    if header
+                    else pd.DataFrame()
+                )
                 sheet_meta[worksheet.title] = {
                     "columns": header,
                     "shape": [worksheet.max_row or 0, worksheet.max_column or len(header)],
@@ -214,8 +218,8 @@ def read_excel(path: Path) -> ReadResult:
                     "preview_rows_per_sheet": 30,
                 },
             )
-        except Exception:
-            LOGGER.exception("Fast Excel preview failed for %s; falling back to pandas", path)
+        except Exception as exc:
+            LOGGER.warning("Fast Excel preview failed for %s (%s); falling back to pandas", path, exc)
 
     sheets = pd.read_excel(path, sheet_name=None, nrows=30)
     previews = []
@@ -235,6 +239,36 @@ def read_excel(path: Path) -> ReadResult:
             "sheets": sheet_meta,
         },
     )
+
+
+def _excel_preview_rows(rows: list[list[Any]], max_column: int) -> tuple[list[str], list[list[Any]]]:
+    """Return rectangular Excel preview rows even when the first row is short.
+
+    Some real workbooks have a title/metadata row with only a few cells, then a
+    much wider body. Pandas requires len(columns) == row width, so build a
+    stable rectangular preview based on the widest observed row/max_column.
+    """
+
+    if not rows:
+        return [], []
+    width = max(max_column, *(len(row) for row in rows))
+    if width <= 0:
+        return [], []
+
+    raw_header = _pad_excel_row(rows[0], width)
+    header = []
+    for index, value in enumerate(raw_header, start=1):
+        text = str(value).strip()
+        header.append(text if text else f"Unnamed: {index}")
+
+    return header, [_pad_excel_row(row, width) for row in rows[1:]]
+
+
+def _pad_excel_row(row: list[Any], width: int) -> list[Any]:
+    padded = list(row[:width])
+    if len(padded) < width:
+        padded.extend([""] * (width - len(padded)))
+    return padded
 
 
 def read_sql(path: Path) -> ReadResult:
