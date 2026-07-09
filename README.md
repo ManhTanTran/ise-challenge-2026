@@ -1,6 +1,6 @@
 # iSE Challenge 2026
 
-Repo này chứa hai hướng giải cho bài toán **iSE Summer Challenge 2026 - Multi-Modal Data Lake Question Answering**.
+Repo này chứa ba hướng giải cho bài toán **iSE Summer Challenge 2026 - Multi-Modal Data Lake Question Answering**.
 
 ## Cấu Trúc Repo
 
@@ -9,6 +9,7 @@ ise-challenge-2026/
   approaches/
     approach_1_solver_baseline/
     approach_2_hybrid_rag/
+    approach_3_agentic_rag/
   data/
     README.md
     sample_data_lake/        # dữ liệu local, không push lên GitHub
@@ -19,7 +20,7 @@ ise-challenge-2026/
   README.md
 ```
 
-## Hai Hướng Giải
+## Ba Hướng Giải
 
 ### Cách 1: Solver Baseline
 
@@ -71,6 +72,27 @@ python -X utf8 -m approaches.approach_2_hybrid_rag.run_pipeline `
   --file-index "approaches\approach_1_solver_baseline\outputs\runs\parse_20260630_095706\file_index.json" `
   --output "approaches\approach_2_hybrid_rag\outputs\submission_full_sample.csv"
 ```
+
+### Cách 3: Agentic Semantic RAG
+
+Nằm ở:
+
+```text
+approaches/approach_3_agentic_rag/
+```
+
+Hiện thực đầy đủ pipeline đề xuất trong docs: vector index ngữ nghĩa (sentence-transformers/FAISS, fallback TF-IDF), question analysis bằng LLM có cache, hybrid retrieval `0.6×vector + 0.4×BM25`, table reasoning bằng pandas do LLM sinh code, và LLM reasoning trả JSON answer+evidences với chain-of-thought.
+
+Chạy cách 3:
+
+```powershell
+python -X utf8 -m approaches.approach_3_agentic_rag.run_pipeline `
+  --questions "data\sample_data_lake\0.Sample_Data.xlsx" `
+  --data-lake "data\sample_data_lake\Data-Lake" `
+  --output "approaches\approach_3_agentic_rag\outputs\submission.csv"
+```
+
+Xem thêm [Cách 3 README](approaches/approach_3_agentic_rag/README.md).
 
 ## Dữ Liệu
 

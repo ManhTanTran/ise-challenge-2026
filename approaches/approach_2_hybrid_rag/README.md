@@ -116,6 +116,15 @@ set OPENROUTER_MODEL=openai/gpt-4.1-mini
 
 Sau đó chạy lại pipeline.
 
+Với ảnh, nếu OCR bằng Tesseract lỗi, rỗng hoặc confidence thấp, pipeline có thể dùng VLM qua OpenRouter để tạo `caption`, `description`, `visible_objects`, `key_values` và bảng nhìn thấy trong ảnh. Các caption này được đưa vào `text_cache/`, `manifest.json` và `chunks.json` để retrieval tìm được ảnh ngay cả khi OCR không đọc ra chữ.
+
+Có thể tắt hoặc ép dùng VLM image parse bằng:
+
+```powershell
+set ISE_IMAGE_PARSE_VLM=off
+set ISE_IMAGE_PARSE_VLM=always
+```
+
 ## Output Và Debug Artifact
 
 Mỗi run ghi:
@@ -128,6 +137,8 @@ Mỗi run ghi:
 - `manifest.json`: index cấp file.
 - `chunks.json`: index cấp đoạn text.
 - `text_cache/`: nội dung parse ra từ Data-Lake dạng `.txt`.
+- `text_cache/*.image_parse.json`: structured OCR/VLM parse cho ảnh, gồm text, caption, description, bảng/key-value nếu có.
+- `vision_cache/`: cache kết quả VLM khi có `OPENROUTER_API_KEY`.
 
 ## Run Đã Verify
 

@@ -637,13 +637,17 @@ def _should_use_vlm_image_parse(parsed: dict[str, Any], *, ignore_env: bool = Fa
         return True
     text = str(parsed.get("plain_text", ""))
     threshold = float(os.getenv("ISE_OCR_MIN_CONFIDENCE", "55"))
+    sparse_chars = int(os.getenv("ISE_OCR_SPARSE_CHARS", "15"))
     word_count = len(parsed.get("words", []) if isinstance(parsed.get("words", []), list) else [])
     line_count = len(parsed.get("lines", []) if isinstance(parsed.get("lines", []), list) else [])
     looks_like_document = word_count >= 5 or line_count >= 3 or len(normalize_spaces(text)) >= 80
     low_confidence = float(parsed.get("avg_confidence", 0.0) or 0.0) < threshold
     short_document_text = len(normalize_spaces(text)) < 25 and looks_like_document
-    empty_ocr = not normalize_spaces(text)
-    return empty_ocr or looks_like_mojibake(text) or (looks_like_document and low_confidence) or short_document_text
+    # Empty OR barely-any text: not a text document, so OCR most likely failed
+    # on a picture (a stylized digit, a photo, a logo). Caption it with the VLM
+    # instead of leaving it findable only by a garbage OCR string like "ra".
+    sparse_ocr = len(normalize_spaces(text)) < sparse_chars
+    return sparse_ocr or looks_like_mojibake(text) or (looks_like_document and low_confidence) or short_document_text
 
 
 def looks_like_mojibake(text: str) -> bool:
@@ -807,7 +811,7 @@ def _parse_jsonish_object(text: str) -> dict[str, Any]:
     if not match:
         return {}
     try:
-        parsed = json.loads(match.group(0))
+        parsed = json.loads(match.group(0), strict=False)
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
@@ -856,6 +860,96 @@ def read_audio(path: Path) -> ReadResult:
         )
 
 
+_HEADER_LABEL_WORDS = {
+    "id", "gene", "name", "value", "count", "score", "type", "date", "label",
+    "key", "item", "index", "no", "stt", "symbol", "sample", "peptide", "protein",
+}
+
+
+def _restore_headerless_list_row(df: pd.DataFrame) -> pd.DataFrame:
+    """Recover a data row that pandas consumed as a header on a headerless list.
+
+    A single-column list sheet (e.g. a gene list "BRD8, DHX15, SSB, ...") has no
+    header row, so pd.read_excel(header=0) turns the first gene ("BRD8") into the
+    column name and loses it - undercounting by one (15 instead of 16). Only fire
+    when the "header" looks like a domain code (single token containing a digit,
+    not a common label word) and the values share that token shape, then prepend
+    it back as the first data row.
+    """
+
+    if df.shape[1] != 1:
+        return df
+    header = str(df.columns[0]).strip()
+    if not header or header.lower() in _HEADER_LABEL_WORDS or " " in header:
+        return df
+    if not re.match(r"^[A-Za-z0-9._-]+$", header) or not any(ch.isdigit() for ch in header):
+        return df
+    values = df.iloc[:, 0]
+    sample = [str(v).strip() for v in values.head(30).tolist() if pd.notna(v)]
+    if not sample:
+        return df
+    tokenish = sum(1 for v in sample if v and " " not in v and re.match(r"^[A-Za-z0-9._-]+$", v))
+    if tokenish < 0.7 * len(sample):
+        return df
+    return pd.DataFrame({"value": [header, *values.tolist()]})
+
+
+def _detect_header_row(path: Path, sheet_name: str, *, max_scan_rows: int = 15) -> int:
+    """Find the row that looks like the real header, skipping leading title/notes rows.
+
+    Some Excel exports (e.g. scientific data supplements) prepend a few
+    metadata/notes rows before the actual column header - pandas' default
+    header=0 then reads that leading text as columns, produces "Unnamed: N"
+    placeholders, and the real header becomes ordinary (unreferenceable) data.
+    Scan the first few raw rows for header candidates (most non-null cells are
+    short strings, not long prose or numbers) but also require the values to
+    be mostly DISTINCT - a units/annotation row like "(ppm)" repeated across
+    every column is short-string-shaped too, and would otherwise outrank the
+    real header sitting just below it. Among qualifying rows, prefer the one
+    with the most filled-in cells (the real header rarely has gaps; a units
+    sub-header often only decorates a subset of columns).
+    """
+
+    try:
+        raw = pd.read_excel(path, sheet_name=sheet_name, header=None, nrows=max_scan_rows)
+    except Exception:
+        return 0
+    best_row, best_count = 0, -1
+    for row_index in range(len(raw)):
+        non_null = raw.iloc[row_index].dropna()
+        if len(non_null) < 2:
+            continue
+        header_like = sum(1 for v in non_null if isinstance(v, str) and 0 < len(v.strip()) <= 40)
+        if header_like < max(2, int(0.7 * len(non_null))):
+            continue
+        distinct_ratio = non_null.astype(str).nunique() / len(non_null)
+        if distinct_ratio < 0.7:
+            continue
+        if len(non_null) > best_count:
+            best_row, best_count = row_index, len(non_null)
+    return best_row
+
+
+def _fix_misplaced_header(frame: pd.DataFrame, path: Path, sheet_name: str) -> pd.DataFrame:
+    """Re-read a sheet whose header row pandas clearly missed.
+
+    Signature of the problem: most columns come back as "Unnamed: N" because
+    the real header wasn't at row 0 (a title/notes block sat above it).
+    """
+
+    columns = list(frame.columns)
+    unnamed = sum(1 for c in columns if str(c).startswith("Unnamed:"))
+    if not columns or unnamed < 0.5 * len(columns):
+        return frame
+    header_row = _detect_header_row(path, sheet_name)
+    if header_row == 0:
+        return frame
+    try:
+        return pd.read_excel(path, sheet_name=sheet_name, header=header_row)
+    except Exception:
+        return frame
+
+
 def load_table_file(path: str | Path) -> dict[str, pd.DataFrame]:
     """Load CSV, Excel, or SQL content into pandas dataframes."""
 
@@ -864,12 +958,18 @@ def load_table_file(path: str | Path) -> dict[str, pd.DataFrame]:
     if extension == ".csv":
         for encoding in DEFAULT_ENCODINGS:
             try:
-                return {file_path.stem: pd.read_csv(file_path, encoding=encoding)}
+                frame = pd.read_csv(file_path, encoding=encoding)
+                return {file_path.stem: _restore_headerless_list_row(frame)}
             except UnicodeDecodeError:
                 continue
-        return {file_path.stem: pd.read_csv(file_path, encoding="latin-1", encoding_errors="replace")}
+        frame = pd.read_csv(file_path, encoding="latin-1", encoding_errors="replace")
+        return {file_path.stem: _restore_headerless_list_row(frame)}
     if extension in {".xlsx", ".xls"}:
-        return pd.read_excel(file_path, sheet_name=None)
+        sheets = pd.read_excel(file_path, sheet_name=None)
+        sheets = {
+            name: _fix_misplaced_header(frame, file_path, name) for name, frame in sheets.items()
+        }
+        return {name: _restore_headerless_list_row(frame) for name, frame in sheets.items()}
     if extension == ".sql":
         with sqlite3.connect(":memory:") as connection:
             connection.executescript(read_text_with_fallback(file_path))
@@ -974,6 +1074,39 @@ def _html_parser() -> str:
         return "lxml"
     except ImportError:
         return "html.parser"
+
+
+def extract_candidate_text(candidate: dict[str, Any]) -> str:
+    """Best-available text for a retrieved candidate: chunks, then cached
+    extraction, then a fresh read, then whatever preview is on hand.
+
+    Shared by readers/dispatcher.py (context assembly) and readers/table.py
+    (roster/document-structure extraction) so both use the exact same
+    fallback order instead of drifting apart.
+    """
+
+    chunks = candidate.get("chunks") or []
+    chunk_text = "\n\n".join(str(chunk.get("text", "")) for chunk in chunks if chunk.get("text"))
+    if chunk_text:
+        return chunk_text
+
+    extracted = candidate.get("extracted_text_path")
+    if extracted and Path(extracted).exists():
+        try:
+            return read_text_with_fallback(extracted)
+        except OSError:
+            pass
+
+    absolute = candidate.get("absolute_path")
+    if absolute and Path(absolute).exists():
+        try:
+            result = read_file(absolute)
+            if result.content:
+                return result.content
+        except Exception as exc:
+            LOGGER.warning("read_file failed for %s: %s", absolute, exc)
+
+    return str(candidate.get("text_preview", ""))
 
 
 def file_metadata(path: str | Path, data_lake_dir: str | Path) -> dict[str, Any]:

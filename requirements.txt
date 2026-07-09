@@ -19,3 +19,7 @@ pytest
 # Optional:
 # openai-whisper
 # rank-bm25
+
+# Optional semantic embeddings for approach 3 (pick ONE; else char TF-IDF is used):
+#   fastembed            # light, ONNX, no torch (recommended on Windows)
+#   sentence-transformers faiss-cpu   # best quality, pulls torch (~2GB)
