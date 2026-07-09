@@ -26,7 +26,7 @@ outputs/
 *.pt
 
 # Local challenge data
-data/sample_data_lake/
+# Keep the sample data lake in GitHub so the repo is self-contained.
 
 # Notebooks
 .ipynb_checkpoints/

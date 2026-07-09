@@ -1,0 +1,9 @@
+The city bus network in An Phu had grown slowly over twenty years, adding routes whenever a new residential area appeared. Tuy nhiên, cách mở rộng này tạo ra một mạng lưới khó hiểu: nhiều tuyến trùng lặp, một số khu đông dân lại ít xe, và thời gian chờ vào giờ cao điểm rất dài. Commuters complained that the printed timetable was outdated almost as soon as it was published.
+
+In 2025, the transport office launched a schedule redesign project. They collected GPS traces from buses, passenger counts from smart cards, and feedback from drivers. Dữ liệu cho thấy ba tuyến trung tâm thường xuyên quá tải, trong khi bốn tuyến ngoại vi chạy gần như rỗng sau 8 giờ tối. Instead of simply buying more buses, the team decided to rebalance frequency and simplify route names.
+
+The new design introduced two express lines connecting residential districts with the university and hospital area. Một số tuyến ngắn được gộp lại để giảm chuyển tuyến không cần thiết, còn các điểm dừng ít người dùng được đánh giá lại. The city also added real-time arrival boards at twenty major stops and released an open API so local developers could build journey-planning tools.
+
+Public reaction was mixed during the first month. Some passengers liked the shorter waiting time on main routes, while others were confused because their familiar bus numbers had changed. Vì vậy, thành phố cử tình nguyện viên đứng tại các bến lớn trong ba tuần để hướng dẫn người dân. A hotline and online feedback form were also opened so problems could be reported quickly.
+
+After four months, average waiting time on the busiest corridors fell by 27 percent, and passenger numbers increased on the express lines. Nhưng dự án cũng cho thấy dữ liệu giao thông không thể tự giải quyết mọi vấn đề; nếu thiếu truyền thông và hỗ trợ tại hiện trường, người dân có thể khó thích nghi. The redesign succeeded because operational data was combined with direct human assistance.
