@@ -73,6 +73,7 @@ def reindex_failed_files(
     *,
     cache_dir: str | Path | None = None,
     statuses: tuple[str, ...] = ("error",),
+    extensions: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Re-run indexing only for files marked with a failing status.
 
@@ -83,6 +84,12 @@ def reindex_failed_files(
     cache already skips on a hit; only files that failed never wrote that
     cache, so only they redo real work here). Writes the merged manifest
     back to `manifest_path`.
+
+    `extensions`, if given (e.g. `(".mp4",)`), additionally restricts the
+    retry to files with one of those extensions - useful right after adding
+    support for a new file type, when other still-unsupported types (e.g.
+    .epub, .glb) share the same "skipped" status and would otherwise also be
+    retried (and fail again) for no reason.
 
     IMPORTANT: after calling this, delete the work dir's `chunks.json` (and
     the vector_index it feeds) before the next `build_indexes(...)` call -
@@ -100,9 +107,18 @@ def reindex_failed_files(
     cache = Path(cache_dir) if cache_dir else manifest_file.parent / "text_cache"
     ensure_dir(cache)
 
-    to_retry = [(index, item) for index, item in enumerate(items) if item.get("status") in statuses]
+    normalized_extensions = {ext.lower() for ext in extensions} if extensions else None
+
+    def _matches(item: dict[str, Any]) -> bool:
+        if item.get("status") not in statuses:
+            return False
+        if normalized_extensions is None:
+            return True
+        return Path(str(item.get("relative_path", ""))).suffix.lower() in normalized_extensions
+
+    to_retry = [(index, item) for index, item in enumerate(items) if _matches(item)]
     if not to_retry:
-        LOGGER.info("No files with status in %s - nothing to retry.", statuses)
+        LOGGER.info("No matching files (status in %s, extensions=%s) - nothing to retry.", statuses, extensions)
         return items
 
     for index, item in tqdm(to_retry, desc="Retrying failed files"):

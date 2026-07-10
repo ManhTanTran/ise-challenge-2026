@@ -46,6 +46,39 @@ def test_reindex_failed_files_only_retries_failing_status(tmp_path: Path, monkey
     }
 
 
+def test_reindex_failed_files_extensions_filter_narrows_to_one_type(tmp_path: Path, monkeypatch):
+    data_root = tmp_path / "lake"
+    data_root.mkdir()
+    (data_root / "video.mp4").write_text("fake", encoding="utf-8")
+    (data_root / "book.epub").write_text("fake", encoding="utf-8")
+
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(
+        manifest_path,
+        [
+            {"relative_path": "video.mp4", "status": "skipped", "error_message": "Unsupported file type."},
+            {"relative_path": "book.epub", "status": "skipped", "error_message": "Unsupported file type."},
+        ],
+    )
+
+    retried_paths = []
+
+    def fake_index_file(path, data_lake_dir, *, cache_dir, force=False):
+        retried_paths.append(Path(path).name)
+        return {"relative_path": Path(path).name, "status": "ok", "error_message": None}
+
+    monkeypatch.setattr(file_indexer_module, "index_file", fake_index_file)
+
+    result = file_indexer_module.reindex_failed_files(
+        manifest_path, data_root, statuses=("skipped",), extensions=(".mp4",)
+    )
+
+    assert retried_paths == ["video.mp4"]  # book.epub left alone
+    by_path = {item["relative_path"]: item for item in result}
+    assert by_path["video.mp4"]["status"] == "ok"
+    assert by_path["book.epub"]["status"] == "skipped"  # untouched
+
+
 def test_reindex_failed_files_noop_when_nothing_failing(tmp_path: Path, monkeypatch):
     manifest_path = tmp_path / "manifest.json"
     _write_manifest(manifest_path, [{"relative_path": "good.txt", "status": "ok"}])

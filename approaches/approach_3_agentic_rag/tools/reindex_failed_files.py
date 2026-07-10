@@ -42,6 +42,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help='Status to retry (repeatable). Defaults to "error" only.',
     )
+    parser.add_argument(
+        "--extension",
+        action="append",
+        default=None,
+        help='Restrict retry to this extension (repeatable, e.g. --extension .mp4). '
+        "Default: no restriction (all files matching --status).",
+    )
     return parser.parse_args(argv)
 
 
@@ -49,11 +56,13 @@ def main(argv: list[str] | None = None) -> None:
     setup_logging()
     args = parse_args(argv)
     statuses = tuple(args.status) if args.status else ("error",)
+    extensions = tuple(args.extension) if args.extension else None
     items = reindex_failed_files(
         args.manifest,
         args.data_lake,
         cache_dir=args.cache_dir,
         statuses=statuses,
+        extensions=extensions,
     )
     still_failing = [item for item in items if item.get("status") == "error"]
     print(f"Manifest now has {len(items)} files; {len(still_failing)} still failing.")
