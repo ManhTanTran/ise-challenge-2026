@@ -8,6 +8,7 @@ pymupdf
 pdfplumber
 python-docx
 python-pptx
+ebooklib
 pillow
 pytesseract
 openai

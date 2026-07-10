@@ -33,7 +33,7 @@ from .utils import (
 LOGGER = logging.getLogger(__name__)
 
 TABLE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".sql"}
-DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".ppt", ".txt", ".md", ".html", ".htm"}
+DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".ppt", ".txt", ".md", ".html", ".htm", ".epub"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4"}
 IMAGE_PARSE_SUFFIX = ".image_parse.json"
@@ -344,6 +344,27 @@ def read_text(path: Path) -> ReadResult:
     """Read plain text and markdown files."""
 
     return ReadResult(str(path), "document", content=read_text_with_fallback(path))
+
+
+def read_epub(path: Path) -> ReadResult:
+    """Extract chapter text from EPUB via ebooklib + BeautifulSoup."""
+
+    import ebooklib
+    from bs4 import BeautifulSoup
+    from ebooklib import epub
+
+    book = epub.read_epub(str(path), options={"ignore_ncx": True})
+    pieces: list[str] = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        soup = BeautifulSoup(item.get_content(), _html_parser())
+        for node in soup(["script", "style", "noscript"]):
+            node.decompose()
+        text = soup.get_text(separator=" ").strip()
+        if text:
+            pieces.append(text)
+    title = book.get_metadata("DC", "title")
+    metadata = {"title": title[0][0] if title else None}
+    return ReadResult(str(path), "document", content="\n\n".join(pieces), metadata=metadata)
 
 
 def read_html(path: Path) -> ReadResult:
@@ -1194,6 +1215,7 @@ def _reader_for_extension(extension: str) -> Callable[[Path], ReadResult] | None
         ".html": read_html,
         ".htm": read_html,
         ".pdf": read_pdf,
+        ".epub": read_epub,
         ".docx": read_docx,
         ".pptx": read_pptx,
         ".ppt": read_ppt,
