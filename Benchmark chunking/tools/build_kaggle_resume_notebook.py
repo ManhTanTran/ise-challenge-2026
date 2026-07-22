@@ -18,9 +18,18 @@ cells = [
     markdown("""# Resume chunking benchmark — PIC, RAPTOR, HiChunk
 
 Use this notebook after Naive/Late have completed. It does not re-run them.
-For HiChunk, `/kaggle/working/chunking_late/hichunk_inputs.json` must still be
-present in the same Kaggle session. Save that file as an output before starting
-a fresh session.
+
+**HiChunk order:** run the dependency cell first, restart the Kaggle session,
+then resume at the setup cell. The attached `hichunk_inputs.json` from the
+Late output is discovered automatically if it is not in `/kaggle/working`.
+"""),
+    markdown("""## HiChunk dependency installation — run first, then restart session
+"""),
+    code("""!pip uninstall -y transformers tokenizers vllm
+!pip install --no-cache-dir --force-reinstall torch==2.7.0 vllm==0.9.1 transformers==4.53.0 nltk liger-kernel
+"""),
+    markdown("""After the install completes, choose **Run → Restart Session**. Do not run
+the remaining cells until the new session starts.
 """),
     code("""from pathlib import Path
 import json, os, shutil, subprocess
@@ -55,9 +64,20 @@ PHASE_LATE = Path('/kaggle/working/chunking_late')
 PHASE_PIC = Path('/kaggle/working/chunking_pic')
 PHASE_RAPTOR = Path('/kaggle/working/chunking_raptor')
 PHASE_HICHUNK = Path('/kaggle/working/chunking_hichunk')
-HICHUNK_INPUTS = PHASE_LATE / 'hichunk_inputs.json'
+_local_hichunk_inputs = PHASE_LATE / 'hichunk_inputs.json'
+_attached_hichunk_inputs = next(
+    (path for path in MOUNT_ROOT.rglob('hichunk_inputs.json') if 'chunking_late' in path.parts),
+    None,
+)
+HICHUNK_INPUTS = (
+    _local_hichunk_inputs
+    if _local_hichunk_inputs.exists()
+    else _attached_hichunk_inputs
+)
+if HICHUNK_INPUTS is None:
+    raise FileNotFoundError('Attach the completed Late output containing chunking_late/hichunk_inputs.json')
 HICHUNK_SPLITS = Path('/kaggle/working/hichunk_splits.json')
-print({'dataset': str(DATASET_ROOT), 'data_lake': str(DATA_LAKE), 'questions': str(QUESTIONS), 'hichunk_inputs_exists': HICHUNK_INPUTS.exists()})
+print({'dataset': str(DATASET_ROOT), 'data_lake': str(DATA_LAKE), 'questions': str(QUESTIONS), 'hichunk_inputs': str(HICHUNK_INPUTS), 'hichunk_inputs_exists': HICHUNK_INPUTS.exists()})
 """),
     code("""REPOS_DIR = WORK_DIR / 'repos'
 REPOS_DIR.mkdir(exist_ok=True)
@@ -135,14 +155,16 @@ else:
     subprocess.run(pic_command, check=True)
     subprocess.run(raptor_command, check=True)
 """),
-    markdown("""## HiChunk dependencies and preflight
-
-These are the versions specified by the HiChunk model card. Restart the Kaggle
-kernel if this installation replaces active Torch/Transformers packages; the
-files under `/kaggle/working` remain available after a kernel restart.
+    markdown("""## Verify HiChunk stack and preflight
 """),
-    code("""!pip -q install torch==2.7.0 vllm==0.9.1 transformers==4.53.0 nltk liger-kernel
+    code("""import torch
+import transformers
+import vllm
 import nltk
+
+print({'torch': torch.__version__, 'transformers': transformers.__version__, 'vllm': vllm.__version__, 'gpu_count': torch.cuda.device_count()})
+if transformers.__version__ != '4.53.0' or vllm.__version__ != '0.9.1':
+    raise RuntimeError('Pinned HiChunk packages were not loaded. Re-run the first install cell and restart the session.')
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 """),
@@ -151,7 +173,7 @@ if not HICHUNK_INPUTS.exists():
     raise FileNotFoundError(f'Missing {HICHUNK_INPUTS}. Restore it from the completed Late run before running HiChunk.')
 tokenizer = AutoTokenizer.from_pretrained('tencent/Youtu-HiChunk', trust_remote_code=True, use_fast=False)
 if isinstance(tokenizer, bool):
-    raise RuntimeError('HiChunk tokenizer is invalid. Restart kernel after installing the pinned dependency stack.')
+    raise RuntimeError('HiChunk tokenizer is invalid despite the pinned stack. Send the version output from the prior cell.')
 print('HiChunk tokenizer:', tokenizer.__class__.__name__)
 """),
     markdown("""## Generate and score HiChunk
