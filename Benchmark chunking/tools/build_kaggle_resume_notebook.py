@@ -105,7 +105,7 @@ print('HiChunk fast-tokenizer compatibility patch applied:', 'use_fast=True' in 
 """),
     markdown("""## PIC and RAPTOR dependencies
 """),
-    code("""!pip -q install "transformers==4.53.0" FlagEmbedding sentence-transformers sentencepiece pymupdf python-docx python-pptx ebooklib beautifulsoup4 lxml openpyxl openai tiktoken umap-learn scikit-learn tenacity faiss-cpu
+    code("""!pip -q install "transformers==4.53.0" FlagEmbedding "sentence-transformers==3.4.1" sentencepiece pymupdf python-docx python-pptx ebooklib beautifulsoup4 lxml openpyxl openai tiktoken umap-learn scikit-learn tenacity faiss-cpu
 """),
     code("""from kaggle_secrets import UserSecretsClient
 from openai import OpenAI
