@@ -53,21 +53,22 @@ shutil.copytree(package_source, WORK_DIR / 'benchmark_chunking', dirs_exist_ok=T
 
 os.chdir(WORK_DIR)
 DATASET_ROOT = INPUT_DIR
-
-DATA_LAKE_CANDIDATES = [
-    INPUT_DIR / 'data' / 'text_sources',
-    INPUT_DIR / 'kaggle_data_only' / 'data' / 'text_sources',
-]
-DATA_LAKE_CANDIDATES.extend(INPUT_DIR.rglob('text_sources'))
-DATA_LAKE = next((path for path in DATA_LAKE_CANDIDATES if path.is_dir()), None)
+MOUNT_ROOT = Path('/kaggle/input')
+DATA_LAKE = next(
+    (path for path in MOUNT_ROOT.rglob('text_sources') if path.is_dir()),
+    None,
+)
 if DATA_LAKE is None:
     raise FileNotFoundError(
-        f'No data/text_sources directory found under {INPUT_DIR}. '
-        f'Mounted roots: {[path.name for path in Path("/kaggle/input").iterdir()]}'
+        f'No data/text_sources directory found under {MOUNT_ROOT}. '
+        f'Mounted roots: {[path.name for path in MOUNT_ROOT.iterdir()]}'
     )
-QUESTIONS = DATASET_ROOT / 'benchmark_questions.xlsx'
-if not QUESTIONS.exists():
-    QUESTIONS = next(INPUT_DIR.rglob('benchmark_questions.xlsx'))
+QUESTIONS = next(
+    (path for path in MOUNT_ROOT.rglob('benchmark_questions.xlsx') if path.is_file()),
+    None,
+)
+if QUESTIONS is None:
+    raise FileNotFoundError(f'No benchmark_questions.xlsx found under {MOUNT_ROOT}.')
 PHASE1 = Path('/kaggle/working/chunking_phase1')
 PHASE2 = Path('/kaggle/working/chunking_hichunk')
 HICHUNK_SPLITS = Path('/kaggle/working/hichunk_splits.json')
