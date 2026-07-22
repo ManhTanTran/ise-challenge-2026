@@ -26,7 +26,19 @@ Attach the `ise-chunking-benchmark` Dataset, enable Internet and a GPU. Set `INP
     code("""from pathlib import Path
 import json, os, shutil, subprocess
 
-INPUT_DIR = Path('/kaggle/input/ise-chunking-benchmark')  # change this slug
+INPUT_DIR = Path('/kaggle/input/ise-chunking-benchmark')  # optional preferred slug
+if not INPUT_DIR.exists():
+    mounted = [path for path in Path('/kaggle/input').iterdir() if path.is_dir()]
+    INPUT_DIR = next(
+        (
+            path
+            for path in mounted
+            if (path / 'data' / 'text_sources').is_dir()
+            or (path / 'kaggle_data_only' / 'data' / 'text_sources').is_dir()
+            or any(path.rglob('text_sources'))
+        ),
+        INPUT_DIR,
+    )
 WORK_DIR = Path('/kaggle/working/ise_chunking_benchmark')
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 BENCHMARK_REPO = 'https://github.com/ManhTanTran/ise-challenge-2026.git'
@@ -42,11 +54,17 @@ shutil.copytree(package_source, WORK_DIR / 'benchmark_chunking', dirs_exist_ok=T
 os.chdir(WORK_DIR)
 DATASET_ROOT = INPUT_DIR
 
-DATA_LAKE = DATASET_ROOT / 'data' / 'text_sources'
-if not DATA_LAKE.exists():
-    DATA_LAKE = WORK_DIR / 'data' / 'text_sources'
-if not DATA_LAKE.exists():
-    DATA_LAKE = next(WORK_DIR.rglob('text_sources'))
+DATA_LAKE_CANDIDATES = [
+    INPUT_DIR / 'data' / 'text_sources',
+    INPUT_DIR / 'kaggle_data_only' / 'data' / 'text_sources',
+]
+DATA_LAKE_CANDIDATES.extend(INPUT_DIR.rglob('text_sources'))
+DATA_LAKE = next((path for path in DATA_LAKE_CANDIDATES if path.is_dir()), None)
+if DATA_LAKE is None:
+    raise FileNotFoundError(
+        f'No data/text_sources directory found under {INPUT_DIR}. '
+        f'Mounted roots: {[path.name for path in Path("/kaggle/input").iterdir()]}'
+    )
 QUESTIONS = DATASET_ROOT / 'benchmark_questions.xlsx'
 if not QUESTIONS.exists():
     QUESTIONS = next(INPUT_DIR.rglob('benchmark_questions.xlsx'))
