@@ -98,7 +98,7 @@ print(resolved)
 """),
     markdown("""## 1. Install shared dependencies
 """),
-    code("""!pip -q install "transformers>=4.53,<4.57" FlagEmbedding sentence-transformers sentencepiece pymupdf python-docx python-pptx ebooklib beautifulsoup4 lxml openpyxl openai tiktoken umap-learn scikit-learn tenacity faiss-cpu
+    code("""!pip -q install "transformers==4.53.0" FlagEmbedding sentence-transformers sentencepiece pymupdf python-docx python-pptx ebooklib beautifulsoup4 lxml openpyxl openai tiktoken umap-learn scikit-learn tenacity faiss-cpu
 """),
     code("""# Regression check: RAPTOR imports FaissRetriever from raptor/__init__.py.
 import faiss, sys
@@ -185,12 +185,21 @@ if RUN_LLM_METHODS:
 """),
     markdown("""## 6. Generate and score official HiChunk
 
-This phase is resumable per source window. If vLLM asks for a restart, restart the kernel, rerun setup through repository-cloning, then continue with this section.
+HiChunk requires the model's pinned dependency stack: `torch==2.7.0`,
+`transformers==4.53.0`, and `vllm==0.9.1`. This phase is resumable per source
+window. If package installation asks for a restart, restart the kernel, rerun
+setup through repository-cloning, then continue with this section.
 """),
-    code("""!pip -q install vllm==0.10.2 nltk liger-kernel
+    code("""!pip -q install torch==2.7.0 vllm==0.9.1 transformers==4.53.0 nltk liger-kernel
 import nltk
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
+"""),
+    code("""from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained('tencent/Youtu-HiChunk', trust_remote_code=True, use_fast=False)
+if isinstance(tokenizer, bool):
+    raise RuntimeError('HiChunk tokenizer did not load. Restart the kernel after installing pinned dependencies.')
+print('HiChunk tokenizer:', tokenizer.__class__.__name__)
 """),
     code("""subprocess.run([
     'python', '-X', 'utf8', '-m', 'benchmark_chunking.tools.generate_hichunk_splits',
