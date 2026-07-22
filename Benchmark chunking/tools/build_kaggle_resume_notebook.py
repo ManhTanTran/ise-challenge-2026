@@ -91,6 +91,15 @@ for name, (url, revision) in REPOS.items():
         subprocess.run(['git', 'clone', '--quiet', url, str(destination)], check=True)
     subprocess.run(['git', '-C', str(destination), 'fetch', '--quiet', '--tags'], check=True)
     subprocess.run(['git', '-C', str(destination), 'checkout', '--quiet', revision], check=True)
+
+# The current HiChunk checkpoint ships tokenizer.json only. Its pinned source
+# requests a slow tokenizer, which Transformers 4.53 resolves incorrectly.
+# Use the supplied fast tokenizer in both the preflight and official runner.
+hichunk_source = REPOS_DIR / 'hichunk' / 'pipeline' / 'chunking' / 'HiChunk' / 'HiChunk.py'
+hichunk_text = hichunk_source.read_text(encoding='utf-8')
+if 'use_fast=False' in hichunk_text:
+    hichunk_source.write_text(hichunk_text.replace('use_fast=False', 'use_fast=True'), encoding='utf-8')
+print('HiChunk fast-tokenizer compatibility patch applied:', 'use_fast=True' in hichunk_source.read_text(encoding='utf-8'))
 """),
     markdown("""## PIC and RAPTOR dependencies
 """),
@@ -171,9 +180,9 @@ nltk.download('punkt_tab', quiet=True)
     code("""from transformers import AutoTokenizer
 if not HICHUNK_INPUTS.exists():
     raise FileNotFoundError(f'Missing {HICHUNK_INPUTS}. Restore it from the completed Late run before running HiChunk.')
-tokenizer = AutoTokenizer.from_pretrained('tencent/Youtu-HiChunk', trust_remote_code=True, use_fast=False)
+tokenizer = AutoTokenizer.from_pretrained('tencent/Youtu-HiChunk', trust_remote_code=True, use_fast=True)
 if isinstance(tokenizer, bool):
-    raise RuntimeError('HiChunk tokenizer is invalid despite the pinned stack. Send the version output from the prior cell.')
+    raise RuntimeError('HiChunk tokenizer is invalid despite the pinned stack and fast-tokenizer patch.')
 print('HiChunk tokenizer:', tokenizer.__class__.__name__)
 """),
     markdown("""## Generate and score HiChunk
