@@ -1,0 +1,1348 @@
+"""Robust readers for files in the multimodal data lake."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import re
+import sqlite3
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+import pandas as pd
+
+from .utils import (
+    DEFAULT_ENCODINGS,
+    detect_mime,
+    dump_json,
+    ensure_dir,
+    load_json,
+    normalize_spaces,
+    read_text_with_fallback,
+    safe_relative_path,
+    stable_hash,
+    truncate_text,
+    write_text,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+TABLE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".sql"}
+DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".ppt", ".txt", ".md", ".html", ".htm", ".epub"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4"}
+IMAGE_PARSE_SUFFIX = ".image_parse.json"
+
+
+@dataclass(slots=True)
+class ReadResult:
+    """Common result shape returned by all readers."""
+
+    path: str
+    modality: str
+    content: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    tables: Any | None = None
+    error: str | None = None
+
+    def to_dict(self, include_tables: bool = False) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "path": self.path,
+            "modality": self.modality,
+            "content": self.content,
+            "metadata": self.metadata,
+            "error": self.error,
+        }
+        if include_tables:
+            data["tables"] = self.tables
+        return data
+
+
+def modality_for_path(path: str | Path) -> str:
+    """Map an extension to a coarse modality."""
+
+    extension = Path(path).suffix.lower()
+    if extension in TABLE_EXTENSIONS:
+        return "table"
+    if extension in DOCUMENT_EXTENSIONS:
+        return "document"
+    if extension in IMAGE_EXTENSIONS:
+        return "image"
+    if extension in AUDIO_EXTENSIONS:
+        return "audio"
+    return "unknown"
+
+
+def cache_path_for_file(
+    path: str | Path,
+    *,
+    data_lake_dir: str | Path | None,
+    cache_dir: str | Path,
+) -> Path:
+    """Return the extraction cache path for a data lake file."""
+
+    source = Path(path)
+    relative = safe_relative_path(source, data_lake_dir) if data_lake_dir else source.name
+    cache_name = f"{stable_hash(relative)}_{source.stem[:80]}.txt"
+    return Path(cache_dir) / cache_name
+
+
+def read_file(
+    path: str | Path,
+    *,
+    cache_dir: str | Path | None = None,
+    data_lake_dir: str | Path | None = None,
+    use_cache: bool = True,
+) -> ReadResult:
+    """Read a file without allowing a single bad file to crash the pipeline."""
+
+    file_path = Path(path)
+    modality = modality_for_path(file_path)
+    if not file_path.exists():
+        return ReadResult(str(file_path), modality, error="File does not exist.")
+
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_path = cache_path_for_file(file_path, data_lake_dir=data_lake_dir, cache_dir=cache_dir)
+        if use_cache and cache_path.exists():
+            content = read_text_with_fallback(cache_path)
+            metadata = {"cache_hit": True, "extracted_text_path": str(cache_path)}
+            if modality == "image":
+                parse_path = image_parse_cache_path(cache_path)
+                parsed = load_json(parse_path, default={})
+                if isinstance(parsed, dict):
+                    metadata.update(_image_parse_metadata(parsed, parse_path))
+            reader = _reader_for_extension(file_path.suffix.lower())
+            if modality == "table" and reader is not None:
+                with contextlib.suppress(Exception):
+                    result = reader(file_path)
+                    result.content = content
+                    result.metadata.update(metadata)
+                    return result
+            return ReadResult(str(file_path), modality, content=content, metadata=metadata)
+
+    reader = _reader_for_extension(file_path.suffix.lower())
+    if reader is None:
+        result = ReadResult(str(file_path), "unknown", error="Unsupported file type.")
+    else:
+        try:
+            if modality == "image":
+                result = read_image(
+                    file_path,
+                    parse_cache_path=image_parse_cache_path(cache_path) if cache_path else None,
+                    use_cache=use_cache,
+                )
+            else:
+                result = reader(file_path)
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            LOGGER.exception("Failed to read %s", file_path)
+            result = ReadResult(str(file_path), modality, error=str(exc))
+
+    if cache_path is not None and result.content and result.error is None:
+        write_text(cache_path, result.content)
+        result.metadata["extracted_text_path"] = str(cache_path)
+    return result
+
+
+def _detect_csv_skiprows(path: Path, encoding: str, *, max_scan_lines: int = 30) -> int:
+    """Find how many leading lines to skip before a CSV's real header row.
+
+    Some CSV exports prepend a title/notes line (often a single bare column)
+    before the real, wider header - pandas' C parser locks its expected
+    column count onto line 0, then raises "Expected N fields, saw M" once it
+    reaches the real data (observed: "Expected 1 fields in line 4, saw 4").
+    Scan the first few lines' field counts and skip to the first line whose
+    count matches the majority of the lines scanned - the real table width.
+    """
+
+    import csv as csv_module
+    from collections import Counter
+
+    try:
+        with open(path, encoding=encoding, newline="") as handle:
+            reader = csv_module.reader(handle)
+            rows = [row for _, row in zip(range(max_scan_lines), reader)]
+    except Exception:
+        return 0
+    if len(rows) < 2:
+        return 0
+    counts = [len(row) for row in rows]
+    majority_count, majority_hits = Counter(counts).most_common(1)[0]
+    if majority_hits < 2:
+        return 0
+    return next((index for index, count in enumerate(counts) if count == majority_count), 0)
+
+
+def read_csv(path: Path) -> ReadResult:
+    """Read CSV with encoding fallback."""
+
+    last_error: Exception | None = None
+    dataframe: pd.DataFrame | None = None
+    used_encoding = ""
+    for encoding in DEFAULT_ENCODINGS:
+        try:
+            dataframe = pd.read_csv(path, encoding=encoding)
+            used_encoding = encoding
+            break
+        except UnicodeDecodeError as exc:
+            last_error = exc
+        except pd.errors.ParserError as exc:
+            last_error = exc
+            skiprows = _detect_csv_skiprows(path, encoding)
+            try:
+                if skiprows > 0:
+                    dataframe = pd.read_csv(path, encoding=encoding, skiprows=skiprows)
+                else:
+                    dataframe = pd.read_csv(path, encoding=encoding, sep=None, engine="python")
+                used_encoding = encoding
+                break
+            except Exception as exc2:
+                last_error = exc2
+                # Genuinely ragged rows even after header-skip - skip the
+                # unparseable lines rather than losing the whole file.
+                try:
+                    dataframe = pd.read_csv(path, encoding=encoding, on_bad_lines="skip")
+                    used_encoding = encoding
+                    break
+                except Exception as exc3:
+                    last_error = exc3
+    if dataframe is None:
+        raise RuntimeError(f"Could not read CSV: {last_error}")
+    content = dataframe.head(50).to_csv(index=False)
+    return ReadResult(
+        str(path),
+        "table",
+        content=content,
+        metadata={
+            "columns": [str(col) for col in dataframe.columns],
+            "shape": list(dataframe.shape),
+            "encoding": used_encoding,
+        },
+    )
+
+
+def read_excel(path: Path) -> ReadResult:
+    """Read Excel sheet names, columns, and a small preview without loading full workbooks."""
+
+    if path.suffix.lower() == ".xlsx":
+        previews: list[str] = []
+        sheet_meta: dict[str, Any] = {}
+        try:
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(path, read_only=True, data_only=True)
+            for worksheet in workbook.worksheets:
+                rows = [
+                    ["" if value is None else value for value in row]
+                    for row in worksheet.iter_rows(max_row=31, values_only=True)
+                ]
+                header, preview_rows = _excel_preview_rows(rows, worksheet.max_column or 0)
+                preview_frame = (
+                    pd.DataFrame(preview_rows, columns=header)
+                    if header
+                    else pd.DataFrame()
+                )
+                sheet_meta[worksheet.title] = {
+                    "columns": header,
+                    "shape": [worksheet.max_row or 0, worksheet.max_column or len(header)],
+                }
+                previews.append(f"Sheet: {worksheet.title}\n{preview_frame.to_csv(index=False)}")
+            workbook.close()
+            return ReadResult(
+                str(path),
+                "table",
+                content="\n\n".join(previews),
+                metadata={
+                    "sheet_names": list(sheet_meta.keys()),
+                    "sheets": sheet_meta,
+                    "preview_rows_per_sheet": 30,
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning("Fast Excel preview failed for %s (%s); falling back to pandas", path, exc)
+
+    sheets = pd.read_excel(path, sheet_name=None, nrows=30)
+    previews = []
+    sheet_meta = {}
+    for sheet_name, dataframe in sheets.items():
+        sheet_meta[sheet_name] = {
+            "columns": [str(col) for col in dataframe.columns],
+            "shape": [len(dataframe), len(dataframe.columns)],
+        }
+        previews.append(f"Sheet: {sheet_name}\n{dataframe.to_csv(index=False)}")
+    return ReadResult(
+        str(path),
+        "table",
+        content="\n\n".join(previews),
+        metadata={
+            "sheet_names": list(sheets.keys()),
+            "sheets": sheet_meta,
+        },
+    )
+
+
+def _excel_preview_rows(rows: list[list[Any]], max_column: int) -> tuple[list[str], list[list[Any]]]:
+    """Return rectangular Excel preview rows, skipping any leading title/notes rows.
+
+    Some real workbooks have a title/metadata row with only a few cells, then a
+    much wider body. Pandas requires len(columns) == row width, so build a
+    stable rectangular preview based on the widest observed row/max_column.
+    The header itself isn't always row 0 either (scientific data supplements
+    routinely prepend a title/notes block before the real header) - reuse the
+    same scoring heuristic as `_detect_header_row` to find it.
+    """
+
+    if not rows:
+        return [], []
+    width = max(max_column, *(len(row) for row in rows))
+    if width <= 0:
+        return [], []
+
+    header_index = _best_header_row_index(rows)
+    raw_header = _pad_excel_row(rows[header_index], width)
+    header = []
+    for index, value in enumerate(raw_header, start=1):
+        text = str(value).strip()
+        header.append(text if text else f"Unnamed: {index}")
+
+    return header, [_pad_excel_row(row, width) for row in rows[header_index + 1 :]]
+
+
+def _pad_excel_row(row: list[Any], width: int) -> list[Any]:
+    padded = list(row[:width])
+    if len(padded) < width:
+        padded.extend([""] * (width - len(padded)))
+    return padded
+
+
+def read_sql(path: Path) -> ReadResult:
+    """Read SQL text and try to infer sqlite table names."""
+
+    text = read_text_with_fallback(path)
+    table_names: list[str] = []
+    with contextlib.suppress(Exception):
+        with sqlite3.connect(":memory:") as connection:
+            connection.executescript(text)
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            table_names = [row[0] for row in rows]
+    return ReadResult(
+        str(path),
+        "table",
+        content=text,
+        metadata={"table_names": table_names},
+    )
+
+
+def read_text(path: Path) -> ReadResult:
+    """Read plain text and markdown files."""
+
+    return ReadResult(str(path), "document", content=read_text_with_fallback(path))
+
+
+def read_epub(path: Path) -> ReadResult:
+    """Extract chapter text from EPUB via ebooklib + BeautifulSoup."""
+
+    import ebooklib
+    from bs4 import BeautifulSoup
+    from ebooklib import epub
+
+    book = epub.read_epub(str(path), options={"ignore_ncx": True})
+    pieces: list[str] = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        soup = BeautifulSoup(item.get_content(), _html_parser())
+        for node in soup(["script", "style", "noscript"]):
+            node.decompose()
+        text = soup.get_text(separator=" ").strip()
+        if text:
+            pieces.append(text)
+    title = book.get_metadata("DC", "title")
+    metadata = {"title": title[0][0] if title else None}
+    return ReadResult(str(path), "document", content="\n\n".join(pieces), metadata=metadata)
+
+
+def read_html(path: Path) -> ReadResult:
+    """Extract visible text from HTML."""
+
+    from bs4 import BeautifulSoup
+
+    html = read_text_with_fallback(path)
+    soup = BeautifulSoup(html, _html_parser())
+    for node in soup(["script", "style", "noscript"]):
+        node.decompose()
+    text = soup.get_text(separator=" ")
+    return ReadResult(str(path), "document", content=truncate_text(text, 200000))
+
+
+def read_pdf(path: Path) -> ReadResult:
+    """Extract text from PDF with PyMuPDF, falling back to pdfplumber."""
+
+    try:
+        import fitz
+
+        pieces: list[str] = []
+        with fitz.open(path) as document:
+            for page_number, page in enumerate(document, start=1):
+                pieces.append(f"\n[Page {page_number}]\n{page.get_text()}")
+        return ReadResult(str(path), "document", content="\n".join(pieces))
+    except Exception as first_error:
+        LOGGER.debug("PyMuPDF failed for %s: %s", path, first_error)
+        import pdfplumber
+
+        pieces = []
+        with pdfplumber.open(path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                pieces.append(f"\n[Page {page_number}]\n{page.extract_text() or ''}")
+        return ReadResult(str(path), "document", content="\n".join(pieces))
+
+
+def read_docx(path: Path) -> ReadResult:
+    """Extract paragraphs and table text from DOCX."""
+
+    from docx import Document
+
+    document = Document(path)
+    pieces = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            pieces.append(" | ".join(cell.text.strip() for cell in row.cells))
+    return ReadResult(str(path), "document", content="\n".join(pieces))
+
+
+def read_pptx(path: Path) -> ReadResult:
+    """Extract text from PPTX slides."""
+
+    from pptx import Presentation
+
+    presentation = Presentation(path)
+    pieces: list[str] = []
+    for index, slide in enumerate(presentation.slides, start=1):
+        slide_text: list[str] = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text:
+                slide_text.append(shape.text)
+        if slide_text:
+            pieces.append(f"\n[Slide {index}]\n" + "\n".join(slide_text))
+    return ReadResult(
+        str(path),
+        "document",
+        content="\n".join(pieces),
+        metadata={"slide_count": len(presentation.slides)},
+    )
+
+
+def read_ppt(path: Path) -> ReadResult:
+    """Best-effort legacy PPT extraction via LibreOffice conversion."""
+
+    executable = _find_executable("soffice") or _find_executable("libreoffice")
+    if executable is None:
+        return ReadResult(
+            str(path),
+            "document",
+            content="",
+            metadata={"needs_conversion": True},
+            error="Legacy .ppt requires LibreOffice/soffice conversion to .pptx.",
+        )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        subprocess.run(
+            [
+                executable,
+                "--headless",
+                "--convert-to",
+                "pptx",
+                "--outdir",
+                temp_dir,
+                str(path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        converted = Path(temp_dir) / f"{path.stem}.pptx"
+        if not converted.exists():
+            return ReadResult(str(path), "document", error="PPT conversion produced no file.")
+        result = read_pptx(converted)
+        result.path = str(path)
+        result.metadata["converted_from_ppt"] = True
+        return result
+
+
+def image_parse_cache_path(text_cache_path: str | Path) -> Path:
+    """Return the structured image parse cache path for an extracted text path."""
+
+    return Path(f"{Path(text_cache_path)}{IMAGE_PARSE_SUFFIX}")
+
+
+def read_image(
+    path: Path,
+    *,
+    parse_cache_path: str | Path | None = None,
+    use_cache: bool = True,
+) -> ReadResult:
+    """Parse image text into plain text plus structured OCR metadata."""
+
+    cache_path = Path(parse_cache_path) if parse_cache_path else None
+    if use_cache and cache_path and cache_path.exists():
+        parsed = load_json(cache_path, default={})
+        if isinstance(parsed, dict):
+            return ReadResult(
+                str(path),
+                "image",
+                content=_image_index_content(parsed),
+                metadata=_image_parse_metadata(parsed, cache_path),
+            )
+
+    try:
+        parsed = _local_image_parse(path)
+        if _should_use_vlm_image_parse(parsed):
+            vlm_parse = _vlm_image_parse(path)
+            if vlm_parse:
+                parsed = _merge_image_parses(parsed, vlm_parse)
+        if cache_path:
+            dump_json(parsed, cache_path)
+        return ReadResult(
+            str(path),
+            "image",
+            content=_image_index_content(parsed),
+            metadata=_image_parse_metadata(parsed, cache_path),
+        )
+    except Exception as exc:
+        vlm_parse = _vlm_image_parse(path)
+        if vlm_parse:
+            vlm_parse["ocr_error"] = str(exc)
+            vlm_parse["needs_vision_model"] = False
+            if cache_path:
+                dump_json(vlm_parse, cache_path)
+            return ReadResult(
+                str(path),
+                "image",
+                content=_image_index_content(vlm_parse),
+                metadata=_image_parse_metadata(vlm_parse, cache_path),
+            )
+        return ReadResult(
+            str(path),
+            "image",
+            content="",
+            metadata={"needs_vision_model": True},
+            error=f"OCR unavailable or failed: {exc}",
+        )
+
+
+def _local_image_parse(path: Path) -> dict[str, Any]:
+    """Run local Tesseract OCR with several preprocessing/layout attempts."""
+
+    from PIL import Image
+    import pytesseract
+
+    tesseract = _find_executable("tesseract")
+    if tesseract:
+        pytesseract.pytesseract.tesseract_cmd = tesseract
+
+    image = Image.open(path)
+    variants = _ocr_image_variants(image)
+    language = _tesseract_language(pytesseract)
+    timeout = float(os.getenv("ISE_OCR_TIMEOUT_SECONDS", "4"))
+    psm_modes = [
+        mode.strip()
+        for mode in os.getenv("ISE_OCR_PSM_MODES", "6,11").split(",")
+        if mode.strip()
+    ]
+    configs = [f"--oem 3 --psm {mode}" for mode in psm_modes]
+
+    attempts: list[dict[str, Any]] = []
+    last_error = ""
+    for variant_name, variant in variants:
+        for config in configs:
+            try:
+                data = pytesseract.image_to_data(
+                    variant,
+                    lang=language,
+                    config=config,
+                    output_type=pytesseract.Output.DICT,
+                    timeout=timeout,
+                )
+                parsed = _parse_tesseract_data(data)
+                parsed.update(
+                    {
+                        "engine": "pytesseract",
+                        "language": language,
+                        "ocr_config": config,
+                        "preprocess": variant_name,
+                        "size": list(image.size),
+                    }
+                )
+                attempts.append(parsed)
+            except Exception as exc:
+                last_error = str(exc)
+
+    if not attempts:
+        raise RuntimeError(last_error or "Tesseract produced no OCR attempts.")
+
+    best = max(attempts, key=_score_image_parse)
+    best["attempt_count"] = len(attempts)
+    best["needs_vision_model"] = _should_use_vlm_image_parse(best, ignore_env=True)
+    return best
+
+
+def _ocr_image_variants(image: Any) -> list[tuple[str, Any]]:
+    from PIL import ImageEnhance, ImageFilter, ImageOps
+
+    rgb = image.convert("RGB")
+    max_side = max(rgb.size)
+    if max_side < 1600:
+        scale = min(3.0, 1600 / max_side)
+        rgb = rgb.resize((int(rgb.width * scale), int(rgb.height * scale)))
+    elif max_side > 2600:
+        scale = 2600 / max_side
+        rgb = rgb.resize((int(rgb.width * scale), int(rgb.height * scale)))
+
+    gray = ImageOps.grayscale(rgb)
+    enhanced = ImageEnhance.Contrast(gray).enhance(1.8)
+    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.4)
+    denoised = enhanced.filter(ImageFilter.MedianFilter(size=3))
+    thresholded = denoised.point(lambda pixel: 255 if pixel > 180 else 0)
+    return [
+        ("gray_enhanced", denoised),
+        ("threshold", thresholded),
+    ]
+
+
+def _tesseract_language(pytesseract_module: Any) -> str:
+    preferred = [part.strip() for part in os.getenv("ISE_OCR_LANG", "vie+eng").split("+") if part.strip()]
+    try:
+        available = set(pytesseract_module.get_languages(config=""))
+    except Exception:
+        available = set()
+    selected = [language for language in preferred if not available or language in available]
+    if selected:
+        return "+".join(selected)
+    return "eng"
+
+
+def _parse_tesseract_data(data: dict[str, list[Any]]) -> dict[str, Any]:
+    words: list[dict[str, Any]] = []
+    total_confidence = 0.0
+    confidence_count = 0
+    row_count = len(data.get("text", []))
+
+    for index in range(row_count):
+        text = _repair_mojibake(normalize_spaces(data.get("text", [""])[index]))
+        confidence = _safe_confidence(data.get("conf", ["-1"])[index])
+        if not text or confidence < 0:
+            continue
+        word = {
+            "text": text,
+            "confidence": confidence,
+            "left": _safe_int(data.get("left", [0])[index]),
+            "top": _safe_int(data.get("top", [0])[index]),
+            "width": _safe_int(data.get("width", [0])[index]),
+            "height": _safe_int(data.get("height", [0])[index]),
+            "block_num": _safe_int(data.get("block_num", [0])[index]),
+            "par_num": _safe_int(data.get("par_num", [0])[index]),
+            "line_num": _safe_int(data.get("line_num", [0])[index]),
+            "word_num": _safe_int(data.get("word_num", [0])[index]),
+        }
+        words.append(word)
+        total_confidence += confidence
+        confidence_count += 1
+
+    lines = _ocr_lines(words)
+    for line in lines:
+        line["text"] = _repair_mojibake(line.get("text", ""))
+    blocks = _ocr_blocks(lines)
+    plain_text = _repair_mojibake("\n".join(line["text"] for line in lines if line.get("text")))
+    return {
+        "plain_text": plain_text,
+        "blocks": blocks,
+        "lines": lines,
+        "words": words,
+        "tables": _table_candidates_from_lines(lines),
+        "key_values": {},
+        "avg_confidence": round(total_confidence / confidence_count, 2) if confidence_count else 0.0,
+    }
+
+
+def _ocr_lines(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    for word in words:
+        key = (
+            int(word.get("block_num", 0) or 0),
+            int(word.get("par_num", 0) or 0),
+            int(word.get("line_num", 0) or 0),
+        )
+        grouped.setdefault(key, []).append(word)
+
+    lines: list[dict[str, Any]] = []
+    for key, line_words in grouped.items():
+        ordered = sorted(line_words, key=lambda item: int(item.get("left", 0) or 0))
+        confidences = [float(item.get("confidence", 0.0) or 0.0) for item in ordered]
+        left = min(int(item.get("left", 0) or 0) for item in ordered)
+        top = min(int(item.get("top", 0) or 0) for item in ordered)
+        right = max(int(item.get("left", 0) or 0) + int(item.get("width", 0) or 0) for item in ordered)
+        bottom = max(int(item.get("top", 0) or 0) + int(item.get("height", 0) or 0) for item in ordered)
+        lines.append(
+            {
+                "text": normalize_spaces(" ".join(str(item.get("text", "")) for item in ordered)),
+                "confidence": round(sum(confidences) / len(confidences), 2) if confidences else 0.0,
+                "bbox": [left, top, right - left, bottom - top],
+                "block_num": key[0],
+                "par_num": key[1],
+                "line_num": key[2],
+            }
+        )
+    return sorted(lines, key=lambda item: (item["bbox"][1], item["bbox"][0]))
+
+
+def _ocr_blocks(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for line in lines:
+        grouped.setdefault(int(line.get("block_num", 0) or 0), []).append(line)
+    blocks: list[dict[str, Any]] = []
+    for block_num, block_lines in grouped.items():
+        text = "\n".join(line.get("text", "") for line in block_lines if line.get("text"))
+        if not text.strip():
+            continue
+        confidences = [float(line.get("confidence", 0.0) or 0.0) for line in block_lines]
+        blocks.append(
+            {
+                "block_num": block_num,
+                "text": text,
+                "confidence": round(sum(confidences) / len(confidences), 2) if confidences else 0.0,
+                "line_count": len(block_lines),
+            }
+        )
+    return sorted(blocks, key=lambda item: item["block_num"])
+
+
+def _table_candidates_from_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    row_texts = [line.get("text", "") for line in lines if len(str(line.get("text", "")).split()) >= 3]
+    if len(row_texts) < 3:
+        return []
+    rows = [[cell for cell in re.split(r"\s{2,}|\s+\|\s+", row) if cell] or [row] for row in row_texts]
+    return [{"rows": rows, "row_count": len(rows), "source": "ocr_lines"}]
+
+
+def _score_image_parse(parsed: dict[str, Any]) -> float:
+    text = str(parsed.get("plain_text", ""))
+    return float(parsed.get("avg_confidence", 0.0) or 0.0) + min(len(text) / 100.0, 25.0)
+
+
+def _should_use_vlm_image_parse(parsed: dict[str, Any], *, ignore_env: bool = False) -> bool:
+    mode = os.getenv("ISE_IMAGE_PARSE_VLM", "auto").lower()
+    if not ignore_env and mode in {"0", "false", "off", "never"}:
+        return False
+    if not ignore_env and mode in {"1", "true", "on", "always", "force"}:
+        return True
+    text = str(parsed.get("plain_text", ""))
+    threshold = float(os.getenv("ISE_OCR_MIN_CONFIDENCE", "55"))
+    sparse_chars = int(os.getenv("ISE_OCR_SPARSE_CHARS", "15"))
+    word_count = len(parsed.get("words", []) if isinstance(parsed.get("words", []), list) else [])
+    line_count = len(parsed.get("lines", []) if isinstance(parsed.get("lines", []), list) else [])
+    looks_like_document = word_count >= 5 or line_count >= 3 or len(normalize_spaces(text)) >= 80
+    low_confidence = float(parsed.get("avg_confidence", 0.0) or 0.0) < threshold
+    short_document_text = len(normalize_spaces(text)) < 25 and looks_like_document
+    # Empty OR barely-any text: not a text document, so OCR most likely failed
+    # on a picture (a stylized digit, a photo, a logo). Caption it with the VLM
+    # instead of leaving it findable only by a garbage OCR string like "ra".
+    sparse_ocr = len(normalize_spaces(text)) < sparse_chars
+    return sparse_ocr or looks_like_mojibake(text) or (looks_like_document and low_confidence) or short_document_text
+
+
+def looks_like_mojibake(text: str) -> bool:
+    """Detect common UTF-8-as-Latin mojibake that appears in weak OCR output."""
+
+    return _mojibake_score(text) >= 2
+
+
+def _repair_mojibake(text: str) -> str:
+    if not text or not looks_like_mojibake(text):
+        return text
+    original_score = _mojibake_score(text)
+    candidates = []
+    for encoding in ("cp1252", "latin-1"):
+        with contextlib.suppress(Exception):
+            if encoding == "cp1252":
+                raw = _bytes_from_cp1252_mojibake(text)
+            else:
+                raw = text.encode("latin-1")
+            candidates.append(raw.decode("utf-8"))
+    if not candidates:
+        return text
+    best = min(candidates, key=_mojibake_score)
+    return best if _mojibake_score(best) < original_score else text
+
+
+def _bytes_from_cp1252_mojibake(text: str) -> bytes:
+    raw = bytearray()
+    for char in text:
+        codepoint = ord(char)
+        if codepoint <= 255:
+            raw.append(codepoint)
+        else:
+            raw.extend(char.encode("cp1252"))
+    return bytes(raw)
+
+
+def _mojibake_score(text: str) -> int:
+    if not text:
+        return 0
+    suspicious = len(re.findall(r"(Ã.|Â.|Ä.|Å.|Æ.|áº|á»|â€|â€™|â€œ|â€)", text))
+    controls = sum(1 for char in text if 0x80 <= ord(char) <= 0x9F)
+    replacements = text.count("�")
+    return suspicious * 2 + controls + replacements * 3
+
+
+def _vlm_image_parse(path: Path) -> dict[str, Any]:
+    try:
+        from .config import VISION_CACHE_DIR
+        from .llm_client import answer_image_from_file, has_llm
+
+        cache_path = _vlm_image_parse_cache_path(path, VISION_CACHE_DIR)
+        cached = load_json(cache_path, default=None)
+        if isinstance(cached, dict):
+            return cached
+        if not has_llm():
+            return {}
+        prompt = """
+Parse and caption this image for a retrieval and question-answering pipeline.
+Return only JSON with keys:
+- plain_text: exact clean text or digits visible in the image, preserving Vietnamese accents when present
+- caption: one concise caption describing the main visual content
+- description: one or two factual sentences describing useful visual details for retrieval
+- tables: array of tables, each with rows as arrays of cell strings
+- key_values: object of important labels/values
+- visible_objects: array of short object/attribute phrases, such as colors, digits, logos, charts, or document type
+- confidence: number from 0 to 1
+If there is no readable text, keep plain_text empty and still provide caption and description.
+Do not answer any hidden question. Only transcribe, describe, or structure visible image content.
+""".strip()
+        raw = answer_image_from_file(prompt, path)
+        parsed = _parse_jsonish_object(raw)
+        if not parsed:
+            parsed = {"description": raw}
+        result = {
+            "plain_text": normalize_spaces(parsed.get("plain_text", "")),
+            "caption": normalize_spaces(parsed.get("caption", "")),
+            "description": normalize_spaces(parsed.get("description", "")),
+            "tables": parsed.get("tables", []) if isinstance(parsed.get("tables", []), list) else [],
+            "key_values": parsed.get("key_values", {}) if isinstance(parsed.get("key_values", {}), dict) else {},
+            "visible_objects": (
+                parsed.get("visible_objects", [])
+                if isinstance(parsed.get("visible_objects", []), list)
+                else []
+            ),
+            "confidence": float(parsed.get("confidence", 0.0) or 0.0),
+            "engine": "vlm",
+        }
+        dump_json(result, cache_path)
+        return result
+    except Exception as exc:
+        LOGGER.warning("VLM image parse failed for %s: %s", path, exc)
+        return {}
+
+
+def _vlm_image_parse_cache_path(path: Path, cache_dir: str | Path) -> Path:
+    stat_key = ""
+    if path.exists():
+        stat = path.stat()
+        stat_key = f":{stat.st_size}:{int(stat.st_mtime)}"
+    key = stable_hash(f"image_parse:{path.as_posix()}:{stat_key}")
+    return ensure_dir(cache_dir) / f"{key}_image_parse.json"
+
+
+def _merge_image_parses(local_parse: dict[str, Any], vlm_parse: dict[str, Any]) -> dict[str, Any]:
+    local_text = normalize_spaces(local_parse.get("plain_text", ""))
+    vlm_text = normalize_spaces(vlm_parse.get("plain_text", ""))
+    pieces = [piece for piece in [local_text, vlm_text] if piece]
+    merged_text = "\n\n".join(dict.fromkeys(pieces))
+    merged = dict(local_parse)
+    merged["plain_text"] = merged_text
+    merged["caption"] = vlm_parse.get("caption", "") or local_parse.get("caption", "")
+    merged["description"] = vlm_parse.get("description", "") or local_parse.get("description", "")
+    merged["visible_objects"] = vlm_parse.get("visible_objects", []) or local_parse.get("visible_objects", [])
+    merged["tables"] = local_parse.get("tables", []) or vlm_parse.get("tables", [])
+    merged["key_values"] = vlm_parse.get("key_values", {}) or local_parse.get("key_values", {})
+    merged["vlm_parse"] = vlm_parse
+    merged["engine"] = "pytesseract+vlm"
+    merged["needs_vision_model"] = False
+    return merged
+
+
+def enrich_image_parse_with_vlm(
+    path: str | Path,
+    *,
+    parse_cache_path: str | Path,
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    """Add VLM captions/text to an already OCR-parsed image and persist it.
+
+    This is the selective second pass used after indexing: if OCR is weak, we
+    keep the OCR output, call the VLM only for that image, then merge the two
+    parses back into the structured image cache.
+    """
+
+    image_path = Path(path)
+    cache_path = Path(parse_cache_path)
+    if use_cache and cache_path.exists():
+        parsed = load_json(cache_path, default={})
+        if isinstance(parsed, dict):
+            local_parse = parsed
+        else:
+            local_parse = {}
+    else:
+        local_parse = {}
+
+    vlm_parse = _vlm_image_parse(image_path)
+    if not vlm_parse:
+        return local_parse
+
+    merged = _merge_image_parses(local_parse, vlm_parse) if local_parse else vlm_parse
+    dump_json(merged, cache_path)
+    return merged
+
+
+def _image_index_content(parsed: dict[str, Any]) -> str:
+    pieces = []
+    plain_text = normalize_spaces(parsed.get("plain_text", ""))
+    caption = normalize_spaces(parsed.get("caption", ""))
+    description = normalize_spaces(parsed.get("description", ""))
+    if plain_text:
+        pieces.append(f"Visible text: {plain_text}")
+    if caption:
+        pieces.append(f"Caption: {caption}")
+    if description and description != caption:
+        pieces.append(f"Description: {description}")
+    visible_objects = parsed.get("visible_objects")
+    if isinstance(visible_objects, list) and visible_objects:
+        objects = ", ".join(normalize_spaces(item) for item in visible_objects if normalize_spaces(item))
+        if objects:
+            pieces.append(f"Visible objects: {objects}")
+    key_values = parsed.get("key_values")
+    if isinstance(key_values, dict) and key_values:
+        pieces.append(f"Key values: {json.dumps(key_values, ensure_ascii=False)}")
+    return "\n".join(pieces)
+
+
+def _image_parse_metadata(parsed: dict[str, Any], parse_path: str | Path | None = None) -> dict[str, Any]:
+    metadata = {
+        "ocr_engine": parsed.get("engine", "pytesseract"),
+        "ocr_confidence": parsed.get("avg_confidence", parsed.get("confidence", 0.0)),
+        "ocr_language": parsed.get("language", ""),
+        "needs_vision_model": parsed.get("needs_vision_model", False),
+        "image_caption": parsed.get("caption", ""),
+        "image_description": parsed.get("description", ""),
+    }
+    if parse_path:
+        metadata["image_parse_path"] = str(parse_path)
+    return metadata
+
+
+def _parse_jsonish_object(text: str) -> dict[str, Any]:
+    match = re.search(r"\{[\s\S]*\}", text or "")
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0), strict=False)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_confidence(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_audio(path: Path) -> ReadResult:
+    """Transcribe audio with OpenRouter or local Whisper, then cache the text."""
+
+    transcript_cache = _audio_transcript_cache_path(path)
+    if transcript_cache.exists():
+        cached = load_json(transcript_cache, default={})
+        if isinstance(cached, dict) and cached.get("text"):
+            return ReadResult(
+                str(path),
+                "audio",
+                content=str(cached.get("text", "")).strip(),
+                metadata={
+                    "transcription_engine": cached.get("engine", "cached"),
+                    "transcript_cache_path": str(transcript_cache),
+                },
+            )
+
+    provider = os.getenv("ISE_TRANSCRIPTION_PROVIDER", "local").strip().lower()
+    if provider == "openrouter":
+        try:
+            from .llm_client import transcribe_audio_file
+
+            text = transcribe_audio_file(path)
+            result = {
+                "text": text.strip(),
+                "engine": os.getenv("ISE_TRANSCRIPTION_MODEL", "openai/whisper-1"),
+            }
+            dump_json(result, transcript_cache)
+            return ReadResult(
+                str(path),
+                "audio",
+                content=result["text"],
+                metadata={
+                    "transcription_engine": result["engine"],
+                    "transcript_cache_path": str(transcript_cache),
+                },
+            )
+        except Exception as exc:
+            return ReadResult(
+                str(path),
+                "audio",
+                content="",
+                metadata={"needs_audio_transcription": True},
+                error=f"OpenRouter audio transcription failed: {exc}",
+            )
+
+    try:
+        _ensure_tool_on_path("ffmpeg")
+        import whisper
+
+        whisper_cache = Path(
+            os.getenv("WHISPER_CACHE_DIR", str(Path.cwd() / "outputs" / "whisper_cache"))
+        )
+        ensure_dir(whisper_cache)
+        whisper_model = os.getenv("ISE_LOCAL_WHISPER_MODEL", "base")
+        model = whisper.load_model(whisper_model, download_root=str(whisper_cache))
+        transcription = model.transcribe(str(path))
+        text = str(transcription.get("text", "")).strip()
+        engine = f"whisper-{whisper_model}"
+        dump_json({"text": text, "engine": engine}, transcript_cache)
+        return ReadResult(
+            str(path),
+            "audio",
+            content=text,
+            metadata={
+                "transcription_engine": engine,
+                "transcript_cache_path": str(transcript_cache),
+            },
+        )
+    except Exception as exc:
+        return ReadResult(
+            str(path),
+            "audio",
+            content="",
+            metadata={"needs_audio_transcription": True},
+            error=f"Audio transcription unavailable or failed: {exc}",
+        )
+
+
+def _audio_transcript_cache_path(path: Path) -> Path:
+    cache_dir = ensure_dir(os.getenv("ISE_TRANSCRIPT_CACHE_DIR", str(Path.cwd() / "outputs" / "transcript_cache")))
+    stat_key = ""
+    if path.exists():
+        stat = path.stat()
+        stat_key = f":{stat.st_size}:{int(stat.st_mtime)}"
+    key = stable_hash(f"audio_transcript:{path.as_posix()}:{stat_key}")
+    return cache_dir / f"{key}_transcript.json"
+
+
+_HEADER_LABEL_WORDS = {
+    "id", "gene", "name", "value", "count", "score", "type", "date", "label",
+    "key", "item", "index", "no", "stt", "symbol", "sample", "peptide", "protein",
+}
+
+
+def _restore_headerless_list_row(df: pd.DataFrame) -> pd.DataFrame:
+    """Recover a data row that pandas consumed as a header on a headerless list.
+
+    A single-column list sheet (e.g. a gene list "BRD8, DHX15, SSB, ...") has no
+    header row, so pd.read_excel(header=0) turns the first gene ("BRD8") into the
+    column name and loses it - undercounting by one (15 instead of 16). Only fire
+    when the "header" looks like a domain code (single token containing a digit,
+    not a common label word) and the values share that token shape, then prepend
+    it back as the first data row.
+    """
+
+    if df.shape[1] != 1:
+        return df
+    header = str(df.columns[0]).strip()
+    if not header or header.lower() in _HEADER_LABEL_WORDS or " " in header:
+        return df
+    if not re.match(r"^[A-Za-z0-9._-]+$", header) or not any(ch.isdigit() for ch in header):
+        return df
+    values = df.iloc[:, 0]
+    sample = [str(v).strip() for v in values.head(30).tolist() if pd.notna(v)]
+    if not sample:
+        return df
+    tokenish = sum(1 for v in sample if v and " " not in v and re.match(r"^[A-Za-z0-9._-]+$", v))
+    if tokenish < 0.7 * len(sample):
+        return df
+    return pd.DataFrame({"value": [header, *values.tolist()]})
+
+
+def _best_header_row_index(rows: list[list[Any]]) -> int:
+    """Pick the first row that looks like a real header out of a list of raw rows.
+
+    Shared scoring heuristic behind both `_detect_header_row` (re-reads an
+    xlsx sheet via pandas for `load_table_file`) and `_excel_preview_rows`
+    (works on rows already loaded via openpyxl for the fast indexing-time
+    preview) - some Excel exports (e.g. scientific data supplements) prepend
+    a few metadata/notes rows before the actual column header, so row 0 isn't
+    always it. A qualifying header row: mostly non-null, mostly short
+    strings (not long prose or numbers), and mostly DISTINCT - a
+    units/annotation row like "(ppm)" repeated across every column is
+    short-string-shaped too but not distinct, so it's skipped in favor of the
+    real header sitting just below it.
+
+    Deliberately returns the FIRST qualifying row, not the "best" one by some
+    score: a real header row is itself followed by data rows that can easily
+    look header-shaped too (e.g. a column of short, all-distinct string
+    values) - preferring "more filled cells" among all qualifying rows would
+    then skip past a perfectly good header into the data beneath it.
+    """
+
+    for row_index, row in enumerate(rows):
+        non_null = [v for v in row if v is not None and v != "" and not (isinstance(v, float) and pd.isna(v))]
+        if len(non_null) < 2:
+            continue
+        header_like = sum(1 for v in non_null if isinstance(v, str) and 0 < len(v.strip()) <= 40)
+        if header_like < max(2, int(0.7 * len(non_null))):
+            continue
+        distinct_ratio = len({str(v) for v in non_null}) / len(non_null)
+        if distinct_ratio < 0.7:
+            continue
+        return row_index
+    return 0
+
+
+def _detect_header_row(path: Path, sheet_name: str, *, max_scan_rows: int = 15) -> int:
+    """Find the row that looks like the real header, skipping leading title/notes rows.
+
+    Some Excel exports prepend a few metadata/notes rows before the actual
+    column header - pandas' default header=0 then reads that leading text as
+    columns, produces "Unnamed: N" placeholders, and the real header becomes
+    ordinary (unreferenceable) data. See `_best_header_row_index` for the
+    scoring heuristic.
+    """
+
+    try:
+        raw = pd.read_excel(path, sheet_name=sheet_name, header=None, nrows=max_scan_rows)
+    except Exception:
+        return 0
+    return _best_header_row_index(raw.values.tolist())
+
+
+def _fix_misplaced_header(frame: pd.DataFrame, path: Path, sheet_name: str) -> pd.DataFrame:
+    """Re-read a sheet whose header row pandas clearly missed.
+
+    Signature of the problem: most columns come back as "Unnamed: N" because
+    the real header wasn't at row 0 (a title/notes block sat above it).
+    """
+
+    columns = list(frame.columns)
+    unnamed = sum(1 for c in columns if str(c).startswith("Unnamed:"))
+    if not columns or unnamed < 0.5 * len(columns):
+        return frame
+    header_row = _detect_header_row(path, sheet_name)
+    if header_row == 0:
+        return frame
+    try:
+        return pd.read_excel(path, sheet_name=sheet_name, header=header_row)
+    except Exception:
+        return frame
+
+
+def load_table_file(path: str | Path) -> dict[str, pd.DataFrame]:
+    """Load CSV, Excel, or SQL content into pandas dataframes."""
+
+    file_path = Path(path)
+    extension = file_path.suffix.lower()
+    if extension == ".csv":
+        for encoding in DEFAULT_ENCODINGS:
+            try:
+                frame = pd.read_csv(file_path, encoding=encoding)
+                return {file_path.stem: _restore_headerless_list_row(frame)}
+            except UnicodeDecodeError:
+                continue
+            except pd.errors.ParserError:
+                try:
+                    frame = pd.read_csv(file_path, encoding=encoding, sep=None, engine="python")
+                    return {file_path.stem: _restore_headerless_list_row(frame)}
+                except Exception:
+                    continue
+        frame = pd.read_csv(file_path, encoding="latin-1", encoding_errors="replace")
+        return {file_path.stem: _restore_headerless_list_row(frame)}
+    if extension in {".xlsx", ".xls"}:
+        sheets = pd.read_excel(file_path, sheet_name=None)
+        sheets = {
+            name: _fix_misplaced_header(frame, file_path, name) for name, frame in sheets.items()
+        }
+        return {name: _restore_headerless_list_row(frame) for name, frame in sheets.items()}
+    if extension == ".sql":
+        with sqlite3.connect(":memory:") as connection:
+            connection.executescript(read_text_with_fallback(file_path))
+            names = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+            ]
+            return {name: pd.read_sql_query(f'SELECT * FROM "{name}"', connection) for name in names}
+    raise ValueError(f"Unsupported table file: {file_path}")
+
+
+def load_sqlite_connection(path: str | Path) -> sqlite3.Connection:
+    """Load a SQL dump into an in-memory sqlite connection."""
+
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(read_text_with_fallback(path))
+    return connection
+
+
+def _reader_for_extension(extension: str) -> Callable[[Path], ReadResult] | None:
+    readers: dict[str, Callable[[Path], ReadResult]] = {
+        ".csv": read_csv,
+        ".xlsx": read_excel,
+        ".xls": read_excel,
+        ".sql": read_sql,
+        ".txt": read_text,
+        ".md": read_text,
+        ".html": read_html,
+        ".htm": read_html,
+        ".pdf": read_pdf,
+        ".epub": read_epub,
+        ".docx": read_docx,
+        ".pptx": read_pptx,
+        ".ppt": read_ppt,
+        ".jpg": read_image,
+        ".jpeg": read_image,
+        ".png": read_image,
+        ".webp": read_image,
+        ".m4a": read_audio,
+        ".mp3": read_audio,
+        ".wav": read_audio,
+        # Whisper's ffmpeg-backed audio loader demuxes the audio track out of
+        # any container, video included - no separate extraction step needed.
+        ".mp4": read_audio,
+    }
+    return readers.get(extension)
+
+
+def _has_executable(name: str) -> bool:
+    return _find_executable(name) is not None
+
+
+def _find_executable(name: str) -> str | None:
+    from shutil import which
+
+    executable = which(name)
+    if executable:
+        return executable
+
+    candidates = _executable_candidates(name)
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _ensure_tool_on_path(name: str) -> None:
+    executable = _find_executable(name)
+    if executable:
+        directory = str(Path(executable).parent)
+        paths = os.environ.get("PATH", "").split(os.pathsep)
+        if directory not in paths:
+            os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
+
+
+def _executable_candidates(name: str) -> list[Path]:
+    suffix = ".exe" if os.name == "nt" and not name.lower().endswith(".exe") else ""
+    executable = f"{name}{suffix}"
+    candidates = [
+        Path("D:/iSE challenge/tools/Tesseract-OCR") / executable,
+        Path("D:/iSE/iSE challenge/tools/Tesseract-OCR") / executable,
+        Path("D:/iSE challenge/tools/LibreOffice/program") / executable,
+        Path("D:/iSE/iSE challenge/tools/LibreOffice/program") / executable,
+        Path("D:/iSE challenge/tools/ffmpeg/bin") / executable,
+        Path("D:/iSE/iSE challenge/tools/ffmpeg/bin") / executable,
+        Path("C:/Program Files/Tesseract-OCR") / executable,
+        Path("C:/Program Files/LibreOffice/program") / executable,
+        Path("C:/Program Files (x86)/LibreOffice/program") / executable,
+    ]
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        winget_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+        if winget_root.exists():
+            candidates.extend(winget_root.glob(f"**/{executable}"))
+    return candidates
+
+
+def _html_parser() -> str:
+    """Prefer lxml, but keep HTML extraction working without it."""
+
+    try:
+        import lxml  # noqa: F401
+
+        return "lxml"
+    except ImportError:
+        return "html.parser"
+
+
+def extract_candidate_text(candidate: dict[str, Any]) -> str:
+    """Best-available text for a retrieved candidate: chunks, then cached
+    extraction, then a fresh read, then whatever preview is on hand.
+
+    Shared by readers/dispatcher.py (context assembly) and readers/table.py
+    (roster/document-structure extraction) so both use the exact same
+    fallback order instead of drifting apart.
+    """
+
+    chunks = candidate.get("chunks") or []
+    chunk_text = "\n\n".join(str(chunk.get("text", "")) for chunk in chunks if chunk.get("text"))
+    if chunk_text:
+        return chunk_text
+
+    extracted = candidate.get("extracted_text_path")
+    if extracted and Path(extracted).exists():
+        try:
+            return read_text_with_fallback(extracted)
+        except OSError:
+            pass
+
+    absolute = candidate.get("absolute_path")
+    if absolute and Path(absolute).exists():
+        try:
+            result = read_file(absolute)
+            if result.content:
+                return result.content
+        except Exception as exc:
+            LOGGER.warning("read_file failed for %s: %s", absolute, exc)
+
+    return str(candidate.get("text_preview", ""))
+
+
+def file_metadata(path: str | Path, data_lake_dir: str | Path) -> dict[str, Any]:
+    """Base metadata shared by the indexer."""
+
+    file_path = Path(path)
+    stat = file_path.stat()
+    return {
+        "filename": file_path.name,
+        "relative_path": safe_relative_path(file_path, data_lake_dir),
+        "absolute_path": str(file_path.resolve()),
+        "extension": file_path.suffix.lower(),
+        "modality": modality_for_path(file_path),
+        "mime_type": detect_mime(file_path),
+        "size_bytes": stat.st_size,
+    }
