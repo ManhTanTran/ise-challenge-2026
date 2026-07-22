@@ -26,10 +26,20 @@ a fresh session.
 import json, os, shutil, subprocess
 
 MOUNT_ROOT = Path('/kaggle/input')
-DATA_LAKE = next((path for path in MOUNT_ROOT.rglob('text_sources') if path.is_dir()), None)
-QUESTIONS = next((path for path in MOUNT_ROOT.rglob('benchmark_questions.xlsx') if path.is_file()), None)
-if DATA_LAKE is None or QUESTIONS is None:
-    raise FileNotFoundError(f'Missing data/text_sources or benchmark_questions.xlsx under {MOUNT_ROOT}')
+DATASET_ROOT = next(
+    (
+        path
+        for path in MOUNT_ROOT.rglob('kaggle_data_only')
+        if path.is_dir()
+        and (path / 'data' / 'text_sources').is_dir()
+        and (path / 'benchmark_questions.xlsx').is_file()
+    ),
+    None,
+)
+if DATASET_ROOT is None:
+    raise FileNotFoundError('Missing kaggle_data_only/data/text_sources or benchmark_questions.xlsx')
+DATA_LAKE = DATASET_ROOT / 'data' / 'text_sources'
+QUESTIONS = DATASET_ROOT / 'benchmark_questions.xlsx'
 
 WORK_DIR = Path('/kaggle/working/ise_chunking_benchmark')
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,7 +57,7 @@ PHASE_RAPTOR = Path('/kaggle/working/chunking_raptor')
 PHASE_HICHUNK = Path('/kaggle/working/chunking_hichunk')
 HICHUNK_INPUTS = PHASE_LATE / 'hichunk_inputs.json'
 HICHUNK_SPLITS = Path('/kaggle/working/hichunk_splits.json')
-print({'data_lake': str(DATA_LAKE), 'questions': str(QUESTIONS), 'hichunk_inputs_exists': HICHUNK_INPUTS.exists()})
+print({'dataset': str(DATASET_ROOT), 'data_lake': str(DATA_LAKE), 'questions': str(QUESTIONS), 'hichunk_inputs_exists': HICHUNK_INPUTS.exists()})
 """),
     code("""REPOS_DIR = WORK_DIR / 'repos'
 REPOS_DIR.mkdir(exist_ok=True)
@@ -83,24 +93,47 @@ if 'base_url' in CLIENT_ARGS:
 OpenAI(api_key=API_KEY, **CLIENT_ARGS).models.list()
 print({'summary_model': SUMMARY_MODEL, 'base_url': CLIENT_ARGS.get('base_url', 'https://api.openai.com/v1')})
 """),
-    markdown("""## Run PIC
+    markdown("""## Run PIC and RAPTOR
+
+When two GPUs are available, PIC uses GPU 0 and RAPTOR uses GPU 1 concurrently.
+With one GPU, the same two independent runs execute sequentially.
 """),
-    code("""subprocess.run([
+    code("""import torch
+
+GPU_COUNT = torch.cuda.device_count()
+print('GPU count:', GPU_COUNT)
+!nvidia-smi -L
+RUN_PIC_RAPTOR_PARALLEL = GPU_COUNT >= 2
+print('Parallel PIC/RAPTOR:', RUN_PIC_RAPTOR_PARALLEL)
+"""),
+    code("""common = [
     'python', '-X', 'utf8', '-m', 'benchmark_chunking.tools.benchmark_all_chunking',
-    '--data-lake', str(DATA_LAKE), '--questions', str(QUESTIONS), '--output-dir', str(PHASE_PIC),
-    '--methods', 'pic', '--summary-model', SUMMARY_MODEL, '--model', 'BAAI/bge-m3', '--device', 'cuda',
-    '--window-tokens', '4096', '--source-window-chars', '8000',
-], check=True)
-"""),
-    markdown("""## Run RAPTOR
-"""),
-    code("""subprocess.run([
-    'python', '-X', 'utf8', '-m', 'benchmark_chunking.tools.benchmark_all_chunking',
-    '--data-lake', str(DATA_LAKE), '--questions', str(QUESTIONS), '--output-dir', str(PHASE_RAPTOR),
-    '--raptor-repo', str(REPOS_DIR / 'raptor'), '--methods', 'raptor_all_nodes',
+    '--data-lake', str(DATA_LAKE), '--questions', str(QUESTIONS),
     '--summary-model', SUMMARY_MODEL, '--model', 'BAAI/bge-m3', '--device', 'cuda',
     '--window-tokens', '4096', '--source-window-chars', '8000',
-], check=True)
+]
+pic_command = common + [
+    '--output-dir', str(PHASE_PIC), '--methods', 'pic', '--pic-summary-tokens', '200',
+]
+raptor_command = common + [
+    '--output-dir', str(PHASE_RAPTOR), '--raptor-repo', str(REPOS_DIR / 'raptor'),
+    '--methods', 'raptor_all_nodes',
+]
+
+def launch_on_gpu(command, gpu_id):
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    return subprocess.Popen(command, env=env)
+
+if RUN_PIC_RAPTOR_PARALLEL:
+    pic_process = launch_on_gpu(pic_command, gpu_id=0)
+    raptor_process = launch_on_gpu(raptor_command, gpu_id=1)
+    pic_result, raptor_result = pic_process.wait(), raptor_process.wait()
+    if pic_result != 0 or raptor_result != 0:
+        raise RuntimeError(f'PIC exit code={pic_result}; RAPTOR exit code={raptor_result}')
+else:
+    subprocess.run(pic_command, check=True)
+    subprocess.run(raptor_command, check=True)
 """),
     markdown("""## HiChunk dependencies and preflight
 
