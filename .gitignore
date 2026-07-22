@@ -30,6 +30,7 @@ outputs/
 
 # Notebooks
 .ipynb_checkpoints/
+Benchmark chunking/*.ipynb
 
 # OS/editor files
 .DS_Store
