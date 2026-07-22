@@ -56,6 +56,8 @@ BENCHMARK_REPO = 'https://github.com/ManhTanTran/ise-challenge-2026.git'
 REPO_ROOT = WORK_DIR / 'ise-challenge-2026'
 if not REPO_ROOT.exists():
     subprocess.run(['git', 'clone', '--quiet', '--depth', '1', BENCHMARK_REPO, str(REPO_ROOT)], check=True)
+else:
+    subprocess.run(['git', '-C', str(REPO_ROOT), 'pull', '--ff-only', '--quiet'], check=True)
 shutil.copytree(REPO_ROOT / 'Benchmark chunking', WORK_DIR / 'benchmark_chunking', dirs_exist_ok=True)
 os.chdir(WORK_DIR)
 

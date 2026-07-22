@@ -12,6 +12,19 @@ from pathlib import Path
 
 def _load_official_module(repo: Path):
     module_path = repo / "pipeline" / "chunking" / "HiChunk" / "HiChunk.py"
+    source = module_path.read_text(encoding="utf-8")
+    scheduler_original = "max_num_batched_tokens=window_size+1000, tensor_parallel_size=1,"
+    scheduler_patched = (
+        "max_num_batched_tokens=min(32768, window_size + max_new_token), "
+        "max_model_len=min(32768, window_size + max_new_token), tensor_parallel_size=1,"
+    )
+    if scheduler_original not in source and scheduler_patched not in source:
+        raise RuntimeError("HiChunk scheduler compatibility patch did not match the pinned official revision.")
+    patched = source.replace("use_fast=False", "use_fast=True").replace(
+        scheduler_original, scheduler_patched
+    )
+    if patched != source:
+        module_path.write_text(patched, encoding="utf-8")
     module_dir = str(module_path.parent.resolve())
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
